@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+env/
+
+# Visual Studio
+.vs/
+bin/
+obj/
+*.user
+
+# App output
+temp_audio.mp3
+*_clips/
+*.mp4
+*.mkv
+*.mov
