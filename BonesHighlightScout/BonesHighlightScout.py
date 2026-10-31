@@ -6,6 +6,7 @@
 # Needs ffmpeg, ffprobe and ffplay on PATH. Python packages: requirements.txt
 
 import ctypes
+import hashlib
 import json
 import os
 import platform
@@ -13,19 +14,21 @@ import queue
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import traceback
-from dataclasses import dataclass
+import webbrowser
+from dataclasses import asdict, dataclass
 
 import tkinter as tk
 import tkinter.font
-from tkinter import filedialog, messagebox
+from tkinter import filedialog
 
 import numpy as np
 import ttkbootstrap as tb
 from ttkbootstrap.constants import *
-from ttkbootstrap.dialogs import Messagebox
+from ttkbootstrap.dialogs import Messagebox, MessageDialog
 from ttkbootstrap.style import ThemeDefinition
 from ttkbootstrap.widgets.scrolled import ScrolledFrame
 from matplotlib.figure import Figure
@@ -36,9 +39,12 @@ try:
 except ImportError:
     TkinterDnD = None
 
-# --- DPI FIX ---
+# --- DPI FIX / TASKBAR ICON ---
 if platform.system() == "Windows":
     try: ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception: pass
+    # Without this Windows groups the window under python.exe and shows Python's icon in the taskbar.
+    try: ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("Bones.HighlightScout")
     except Exception: pass
 
 # --- CONSTANTS ---
@@ -89,6 +95,14 @@ def theme_colors(colorblind):
 APP_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "BonesHighlightScout")
 SETTINGS_PATH = os.path.join(APP_DIR, "settings.json")
 ERROR_LOG_PATH = os.path.join(APP_DIR, "error.log")
+SESSIONS_DIR = os.path.join(APP_DIR, "sessions")
+ICON_FILE = "HighlightScout.ico"
+
+CAPTION_STUDIO_NAME = "Bones' Caption Studio"
+CAPTION_STUDIO_EXE = "BonesCaptionStudio.exe"
+CAPTION_STUDIO_URL = None   # TODO: download page for Bones' Caption Studio. Until it's set, GET IT shows a "coming soon" note.
+CAPTION_STUDIO_PITCH = "Try Bones' Caption Studio!"
+
 NO_WINDOW = subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0
 
 VIDEO_TYPES = [("Video files", "*.mp4 *.mkv *.mov *.avi *.webm *.flv *.m4v *.ts"), ("All files", "*.*")]
@@ -116,6 +130,7 @@ DEFAULT_SETTINGS = {
     "export_mode": "Accurate (re-encode)",
     "last_dir": "",
     "colorblind": False,
+    "caption_studio_path": "",
 }
 
 
@@ -179,8 +194,118 @@ def log_error(text):
         with open(ERROR_LOG_PATH, "a", encoding="utf-8") as f: f.write(text + "\n")
     except OSError: pass
 
+def app_dir():
+    """Folder holding the .exe when built with PyInstaller, otherwise this script's folder."""
+    return os.path.dirname(sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__))
+
+def resource_path(name):
+    """Files bundled into the build (like the icon) live in _MEIPASS when frozen."""
+    return os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))), name)
+
+def find_tool(name):
+    """An ffmpeg/ folder next to the app wins over PATH, so a build can ship its own ffmpeg."""
+    bundled = os.path.join(app_dir(), "ffmpeg", name + ".exe")
+    return bundled if os.path.isfile(bundled) else shutil.which(name)
+
+def tool(name):
+    return find_tool(name) or name
+
 def missing_tools():
-    return [t for t in ("ffmpeg", "ffprobe", "ffplay") if shutil.which(t) is None]
+    return [t for t in ("ffmpeg", "ffprobe", "ffplay") if find_tool(t) is None]
+
+# --- CLIP MEMORY ---
+# Clips are saved per video (keyed by path, size and modified time) so reopening a video brings them back.
+def session_file(video_path):
+    try: st = os.stat(video_path)
+    except OSError: return None
+    key = f"{os.path.abspath(video_path).lower()}|{st.st_size}|{int(st.st_mtime)}"
+    return os.path.join(SESSIONS_DIR, hashlib.sha1(key.encode("utf-8")).hexdigest()[:16] + ".json")
+
+def save_session(video_path, clips):
+    path = session_file(video_path)
+    if not path: return
+    try:
+        if not clips:
+            if os.path.exists(path): os.remove(path)
+            return
+        os.makedirs(SESSIONS_DIR, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"video": video_path, "clips": [asdict(c) for c in clips]}, f, indent=1)
+    except OSError: pass
+
+def load_session(video_path, duration):
+    path = session_file(video_path)
+    if not path: return []
+    try:
+        with open(path, encoding="utf-8") as f: saved = json.load(f)["clips"]
+        clips = [Clip(start=float(c["start"]), end=float(c["end"]), peak=float(c["peak"]), score=float(c["score"]),
+                      title=str(c["title"]), selected=bool(c["selected"])) for c in saved]
+    except (OSError, TypeError, ValueError, KeyError): return []
+    return [c for c in clips if 0 <= c.start < c.end <= duration + 0.5]
+
+# --- BONES' CAPTION STUDIO ---
+def _caption_studio_from_registry():
+    try: import winreg
+    except ImportError: return
+    for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+        try:
+            with winreg.OpenKey(hive, rf"Software\Microsoft\Windows\CurrentVersion\App Paths\{CAPTION_STUDIO_EXE}") as key:
+                yield winreg.QueryValue(key, None)
+        except OSError: pass
+        for root in (r"Software\Microsoft\Windows\CurrentVersion\Uninstall", r"Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"):
+            try: uninstall = winreg.OpenKey(hive, root)
+            except OSError: continue
+            with uninstall:
+                for i in range(winreg.QueryInfoKey(uninstall)[0]):
+                    try:
+                        with winreg.OpenKey(uninstall, winreg.EnumKey(uninstall, i)) as app:
+                            if "caption studio" not in str(winreg.QueryValueEx(app, "DisplayName")[0]).lower(): continue
+                            for value in ("InstallLocation", "DisplayIcon"):
+                                try: yield str(winreg.QueryValueEx(app, value)[0]).split(",")[0].strip('"')
+                                except OSError: pass
+                    except OSError: pass
+
+def _caption_studio_from_shortcuts():
+    """Targets of Desktop / Start Menu shortcuts named like Caption Studio (resolved by Windows itself)."""
+    script = ("$ws=New-Object -ComObject WScript.Shell;"
+              "foreach($f in 'Desktop','CommonDesktopDirectory','StartMenu','CommonStartMenu'){"
+              "$d=[Environment]::GetFolderPath($f); if($d -and (Test-Path $d)){"
+              "Get-ChildItem $d -Recurse -Depth 3 -Filter *.lnk -ErrorAction SilentlyContinue |"
+              "Where-Object { $_.Name -match 'caption\\s*studio' } | ForEach-Object { $ws.CreateShortcut($_.FullName).TargetPath } } }")
+    try:
+        result = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+                                capture_output=True, text=True, timeout=15, creationflags=NO_WINDOW)
+        yield from (line.strip() for line in result.stdout.splitlines() if line.strip())
+    except (OSError, subprocess.SubprocessError): return
+
+def _search_folder_for_exe(folder, depth=4):
+    """Looks for the Caption Studio .exe under folder, skipping PyInstaller's half-built build/ copies."""
+    for current, dirs, files in os.walk(folder):
+        level = current[len(folder):].count(os.sep)
+        dirs[:] = [d for d in dirs if d.lower() not in ("build", "venv", ".venv", "node_modules", "_internal", ".git") and level < depth]
+        if CAPTION_STUDIO_EXE in files: return os.path.join(current, CAPTION_STUDIO_EXE)
+    return None
+
+def _caption_studio_candidates(saved_path):
+    if saved_path: yield saved_path
+    yield from _caption_studio_from_registry()
+    for base in (os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)"), os.path.join(os.environ.get("LOCALAPPDATA", ""), "Programs")):
+        if not base: continue
+        for folder in ("Bones' Caption Studio", "Bones Caption Studio", "BonesCaptionStudio"):
+            yield os.path.join(base, folder, CAPTION_STUDIO_EXE)
+    # Installed side by side with Highlight Scout (e.g. both in one "Bones" folder).
+    for parent in {os.path.dirname(app_dir()), os.path.dirname(os.path.dirname(app_dir()))}:
+        try: siblings = [os.path.join(parent, d) for d in os.listdir(parent) if "caption" in d.lower() and "studio" in d.lower()]
+        except OSError: continue
+        for folder in siblings: yield _search_folder_for_exe(folder)
+    for target in _caption_studio_from_shortcuts():
+        yield _search_folder_for_exe(target) if os.path.isdir(target) else target
+
+def find_caption_studio(saved_path=""):
+    for candidate in _caption_studio_candidates(saved_path):
+        if candidate and os.path.isdir(candidate): candidate = _search_folder_for_exe(candidate)
+        if candidate and candidate.lower().endswith(".exe") and os.path.isfile(candidate): return candidate
+    return None
 
 def load_settings():
     settings = dict(DEFAULT_SETTINGS)
@@ -206,7 +331,7 @@ _procs_lock = threading.Lock()
 
 def start_process(cmd, **kwargs):
     try: proc = subprocess.Popen(cmd, creationflags=NO_WINDOW, **kwargs)
-    except FileNotFoundError: raise ScoutError(f"{cmd[0]} wasn't found. Install ffmpeg and make sure it's on PATH.")
+    except FileNotFoundError: raise ScoutError(f"{os.path.basename(cmd[0])} wasn't found. Install ffmpeg and make sure it's on PATH.")
     with _procs_lock: _active_procs.add(proc)
     return proc
 
@@ -220,7 +345,7 @@ def kill_all_processes():
 
 def probe_video(path):
     """Returns (duration_seconds, has_audio)."""
-    cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration:stream=codec_type", "-of", "json", path]
+    cmd = [tool("ffprobe"), "-v", "error", "-show_entries", "format=duration:stream=codec_type", "-of", "json", path]
     try: result = subprocess.run(cmd, capture_output=True, creationflags=NO_WINDOW)
     except FileNotFoundError: raise ScoutError("ffprobe wasn't found. Install ffmpeg and make sure it's on PATH.")
     if result.returncode != 0: raise ScoutError("Couldn't read this file. Is it a video?\n\n" + error_tail(result.stderr))
@@ -234,7 +359,7 @@ def probe_video(path):
 def analyze_audio(path, duration, progress, cancel_event):
     """Streams the audio out of ffmpeg and returns its loudness in dB, one value per HOP_SECONDS."""
     hop = int(ANALYSIS_RATE * HOP_SECONDS)
-    cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-v", "error", "-i", path,
+    cmd = [tool("ffmpeg"), "-hide_banner", "-nostdin", "-v", "error", "-i", path,
            "-vn", "-ac", "1", "-ar", str(ANALYSIS_RATE), "-f", "s16le", "-"]
     expected = duration * ANALYSIS_RATE
     parts, carry, read = [], np.empty(0, np.float32), 0
@@ -311,7 +436,7 @@ def find_highlights(smooth, base, mode, threshold_db, jump_db, pre_roll, post_ro
 
 # --- EXPORT ---
 def build_export_cmd(src, clip, out, mode):
-    cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-y", "-ss", f"{clip.start:.3f}", "-i", src, "-t", f"{clip.end - clip.start:.3f}"]
+    cmd = [tool("ffmpeg"), "-hide_banner", "-nostdin", "-y", "-ss", f"{clip.start:.3f}", "-i", src, "-t", f"{clip.end - clip.start:.3f}"]
     if mode == "copy":
         cmd += ["-map", "0:v:0?", "-map", "0:a:0?", "-c", "copy", "-avoid_negative_ts", "make_zero"]
     else:
@@ -364,13 +489,14 @@ class ClipRow:
     start_entry: tb.Entry
     end_entry: tb.Entry
     length_label: tb.Label
+    num_label: tb.Label
     valid: bool = True
 
 
 class HighlightScout:
     def __init__(self):
         self.settings = load_settings()
-        self.root = tb.Window(themename="darkly")
+        self.root = tb.Window(themename="darkly", iconphoto=None)   # None: skip ttkbootstrap's own icon so ours shows
         self.style = self.root.style
         for colorblind in (False, True):
             self.style.register_theme(ThemeDefinition(theme_name(colorblind), theme_colors(colorblind), "dark"))
@@ -379,6 +505,8 @@ class HighlightScout:
         self.root.title(f"Bones Highlight Scout v{APP_VERSION}")
         self.root.geometry("1280x780"); self.root.minsize(1000, 640)
         self.root.report_callback_exception = self._on_tk_error
+        try: self.root.iconbitmap(default=resource_path(ICON_FILE))   # default= also covers dialogs
+        except tk.TclError: pass
 
         self.ui_queue = queue.Queue()        # worker threads hand UI updates to the main thread through this
         self.cancel_event = threading.Event()
@@ -391,6 +519,9 @@ class HighlightScout:
         self.base = None
         self.clips = []
         self.rows = []
+        self.current_row = None
+        self.last_export_dir = ""
+        self._save_job = None
         self.span_artists = []
         self.limit_line = None
 
@@ -398,6 +529,7 @@ class HighlightScout:
         self._apply_theme(redraw=False)
         self._build_ui()
         self._register_drop_targets()
+        self._bind_shortcuts()
         self._poll_queue()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(300, self._check_tools)
@@ -417,6 +549,8 @@ class HighlightScout:
         s.configure("Panel.TFrame", background=PANEL_BG, bordercolor=PANEL_BORDER)
         s.configure("Muted.TLabel", background=PANEL_BG, foreground=TEXT_MUTED, font=FONT_SMALL)
         s.configure("Status.TLabel", background=PANEL_BG, foreground=p["accent"], font=FONT_BOLD)
+        s.configure("RowNum.TLabel", background=PANEL_BG, foreground=TEXT_MUTED, font=FONT)
+        s.configure("RowNumCurrent.TLabel", background=PANEL_BG, foreground=p["accent"], font=FONT_BOLD)
 
         def button(name, bg, fg, border, hover_bg, hover_fg, hover_border, disabled_bg, disabled_fg, disabled_border):
             s.configure(name, background=bg, foreground=fg, bordercolor=border, lightcolor=bg, darkcolor=bg,
@@ -491,7 +625,9 @@ class HighlightScout:
         self.toggle_btn = tb.Button(header, text="SELECT ALL", style="Bones.TButton", command=self.toggle_all)
         self.toggle_btn.pack(side=LEFT)
         self.count_label = tb.Label(header, text=""); self.count_label.pack(side=LEFT, padx=12)
-        tb.Label(header, text="Times accept 83, 1:23 or 1:02:03", style="Muted.TLabel").pack(side=RIGHT)
+        tb.Label(header, style="Muted.TLabel", justify=RIGHT,
+                 text="Times accept 83, 1:23 or 1:02:03\n"
+                      "Space preview · ↑↓ pick clip · Del delete · Esc stop · Ctrl+O load · F5 scan · Ctrl+R render").pack(side=RIGHT)
 
         self.list_frame = ScrolledFrame(parent, autohide=True)
         self.list_frame.pack(fill=BOTH, expand=YES, padx=8)
@@ -510,6 +646,7 @@ class HighlightScout:
         tb.Button(footer, text="...", style="Bones.TButton", width=3, command=self.choose_output_dir).grid(row=0, column=4, padx=6)
         self.render_btn = tb.Button(footer, text="RENDER SELECTED", style="BonesAccent.TButton", command=self.render)
         self.render_btn.grid(row=0, column=5)
+        tb.Button(footer, text="CAPTION STUDIO", style="Bones.TButton", command=self.open_caption_studio).grid(row=0, column=6, padx=(6, 0))
 
     def _build_waveform(self, parent):
         self.fig = Figure(figsize=(10, 2.1), dpi=100, facecolor=PANEL_BG)
@@ -624,6 +761,7 @@ class HighlightScout:
         if not path: return
         self.settings["last_dir"] = os.path.dirname(path)
         self._stop_preview()
+        self._save_session_now()   # keep the current video's clips before switching
 
         def work(progress):
             duration, has_audio = probe_video(path)
@@ -640,9 +778,10 @@ class HighlightScout:
             stem = os.path.splitext(os.path.basename(path))[0]
             self.out_var.set(os.path.join(os.path.dirname(path), f"{stem}_clips"))
             self.file_label.configure(text=f"{os.path.basename(path)}  ({fmt_time(self.duration)})", foreground=TEXT)
-            self._set_clips([])
+            restored = load_session(path, self.duration)
+            self._set_clips(restored)
             self._draw_waveform()
-            self.status_label.configure(text="READY TO SCAN")
+            self.status_label.configure(text=f"RESTORED {len(restored)} CLIPS FROM LAST TIME" if restored else "READY TO SCAN")
 
         self._run_in_background("OPENING VIDEO...", work, done)
 
@@ -655,6 +794,7 @@ class HighlightScout:
                                 round(self.pre_var.get()), round(self.post_var.get()),
                                 int(round(self.max_var.get())), self.duration)
         self._set_clips(clips)
+        self._schedule_session_save()
         if clips:
             self.status_label.configure(text=f"FOUND {len(clips)} CLIPS")
         else:
@@ -675,6 +815,8 @@ class HighlightScout:
         if clips: self.empty_label.pack_forget()
         else: self.empty_label.pack(pady=40)
         for n, clip in enumerate(clips, 1): self.rows.append(self._make_row(n, clip))
+        self.current_row = None
+        self._set_current_row(self.rows[0] if self.rows else None)
         self.list_frame.yview_moveto(0)
         self._refresh_counts(); self._draw_clip_spans()
 
@@ -686,24 +828,51 @@ class HighlightScout:
         end_var = tk.StringVar(value=fmt_time(clip.end))
 
         tb.Checkbutton(frame, variable=sel_var, bootstyle="primary-round-toggle").pack(side=LEFT, padx=(4, 6))
-        tb.Label(frame, text=f"{number:02d}", width=3, foreground=TEXT_MUTED).pack(side=LEFT)
+        num_label = tb.Label(frame, text=f"{number:02d}", width=3, style="RowNum.TLabel"); num_label.pack(side=LEFT)
         tb.Entry(frame, textvariable=title_var, bootstyle="primary").pack(side=LEFT, fill=X, expand=YES, padx=(4, 8))
         start_entry = tb.Entry(frame, textvariable=start_var, width=8, justify=CENTER, bootstyle="primary"); start_entry.pack(side=LEFT)
         tb.Label(frame, text="–").pack(side=LEFT, padx=3)
         end_entry = tb.Entry(frame, textvariable=end_var, width=8, justify=CENTER, bootstyle="primary"); end_entry.pack(side=LEFT)
         length_label = tb.Label(frame, text="", width=6, foreground=TEXT_MUTED); length_label.pack(side=LEFT, padx=6)
 
-        row = ClipRow(clip, frame, sel_var, title_var, start_var, end_var, start_entry, end_entry, length_label)
+        row = ClipRow(clip, frame, sel_var, title_var, start_var, end_var, start_entry, end_entry, length_label, num_label)
         tb.Button(frame, text="DELETE", style="BonesDanger.TButton", command=lambda: self._delete_row(row)).pack(side=RIGHT, padx=(4, 0))
         tb.Button(frame, text="PREVIEW", style="Bones.TButton", command=lambda: self._preview_row(row)).pack(side=RIGHT, padx=(4, 0))
 
+        # Clicking or typing anywhere in a row makes it the one the keyboard shortcuts act on.
+        for widget in (frame, *frame.winfo_children()):
+            widget.bind("<Button-1>", lambda e: self._set_current_row(row), add="+")
+            widget.bind("<FocusIn>", lambda e: self._set_current_row(row), add="+")
+
         # Traces keep the clip in sync on every keystroke, so nothing typed is lost when you click straight to RENDER.
         sel_var.trace_add("write", lambda *_: self._on_select_changed(row))
-        title_var.trace_add("write", lambda *_: setattr(row.clip, "title", row.title_var.get()))
+        title_var.trace_add("write", lambda *_: self._on_title_edited(row))
         start_var.trace_add("write", lambda *_: self._on_time_edited(row))
         end_var.trace_add("write", lambda *_: self._on_time_edited(row))
         self._update_length_label(row)
         return row
+
+    def _set_current_row(self, row):
+        if row is self.current_row: return
+        if self.current_row is not None and self.current_row in self.rows:
+            self.current_row.num_label.configure(style="RowNum.TLabel")
+        self.current_row = row
+        if row is not None:
+            row.num_label.configure(style="RowNumCurrent.TLabel")
+            self._scroll_row_into_view(row)
+
+    def _scroll_row_into_view(self, row):
+        self.root.update_idletasks()
+        total = self.list_frame.winfo_height()          # full height of the list
+        if total <= 1: return
+        first, last = (float(f) for f in self.list_frame.vscroll.get())   # visible part, as fractions
+        top, bottom = row.frame.winfo_y(), row.frame.winfo_y() + row.frame.winfo_height()
+        if top < first * total: self.list_frame.yview_moveto(top / total)
+        elif bottom > last * total: self.list_frame.yview_moveto(bottom / total - (last - first))
+
+    def _on_title_edited(self, row):
+        row.clip.title = row.title_var.get()
+        self._schedule_session_save()
 
     def _on_time_edited(self, row):
         start, end = parse_time(row.start_var.get()), parse_time(row.end_var.get())
@@ -715,6 +884,7 @@ class HighlightScout:
             if fmt_time(start) != fmt_time(row.clip.start): row.clip.start = start
             if fmt_time(end) != fmt_time(row.clip.end): row.clip.end = min(end, self.duration)
             self._draw_clip_spans()
+            self._schedule_session_save()
         self._update_length_label(row)
 
     def _update_length_label(self, row):
@@ -723,15 +893,62 @@ class HighlightScout:
     def _on_select_changed(self, row):
         row.clip.selected = row.sel_var.get()
         self._refresh_counts(); self._draw_clip_spans()
+        self._schedule_session_save()
 
     def _delete_row(self, row):
+        index = self.rows.index(row)
         self.clips.remove(row.clip); self.rows.remove(row); row.frame.destroy()
+        if row is self.current_row:
+            self.current_row = None
+            if self.rows: self._set_current_row(self.rows[min(index, len(self.rows) - 1)])
         if not self.clips: self.empty_label.pack(pady=40)
         self._refresh_counts(); self._draw_clip_spans()
+        self._schedule_session_save()
 
     def _preview_row(self, row):
+        self._set_current_row(row)
         if not row.valid: self._show_warning("Fix the start/end time first (it's shown in red)."); return
         self.preview(row.clip.start, row.clip.end)
+
+    # --- CLIP MEMORY ---
+    def _schedule_session_save(self):
+        if self._save_job is not None: self.root.after_cancel(self._save_job)
+        self._save_job = self.root.after(800, self._save_session_now)
+
+    def _save_session_now(self):
+        if self._save_job is not None:
+            self.root.after_cancel(self._save_job); self._save_job = None
+        if self.video_path: save_session(self.video_path, self.clips)
+
+    # --- KEYBOARD SHORTCUTS ---
+    def _bind_shortcuts(self):
+        r = self.root
+        r.bind_all("<Control-o>", lambda e: self.load_video())
+        r.bind_all("<Control-O>", lambda e: self.load_video())
+        r.bind_all("<F5>", lambda e: self.scan())
+        r.bind_all("<Control-r>", lambda e: self.render())
+        r.bind_all("<Control-R>", lambda e: self.render())
+        r.bind_all("<Escape>", self._on_escape)
+        r.bind_all("<space>", lambda e: self._row_key(e, lambda row: self._preview_row(row)))
+        r.bind_all("<Delete>", lambda e: self._row_key(e, self._delete_row))
+        r.bind_all("<Up>", lambda e: self._row_key(e, lambda row: self._move_current(-1)))
+        r.bind_all("<Down>", lambda e: self._row_key(e, lambda row: self._move_current(1)))
+
+    def _row_key(self, event, action):
+        """Row shortcuts stay out of the way while typing in a box or using a dropdown/button."""
+        if event.widget.winfo_class() in ("TEntry", "Entry", "TCombobox", "TSpinbox", "Text", "TButton", "TCheckbutton", "Listbox"): return
+        if self.busy or not self.rows: return
+        if self.current_row not in self.rows: self._set_current_row(self.rows[0])
+        action(self.current_row)
+        return "break"
+
+    def _move_current(self, step):
+        index = self.rows.index(self.current_row) + step
+        self._set_current_row(self.rows[max(0, min(index, len(self.rows) - 1))])
+
+    def _on_escape(self, event):
+        self._stop_preview()
+        self.root.focus_set()   # leave a text box so Space / arrows / Delete work again
 
     def toggle_all(self):
         new_state = not all(c.selected for c in self.clips)
@@ -788,24 +1005,25 @@ class HighlightScout:
         for artist in self.span_artists: artist.remove()
         self.span_artists = []
         if self.smooth is not None:
-            for n, clip in enumerate(self.clips, 1):
+            for row in self.rows:   # label each block with its row's number, which stays put when others are deleted
+                clip = row.clip
                 color = self.palette["accent_hover"] if clip.selected else TEXT_MUTED
                 self.span_artists.append(self.ax.axvspan(clip.start, clip.end, color=color, alpha=0.18 if clip.selected else 0.1, linewidth=0))
-                self.span_artists.append(self.ax.text(clip.start, -2, str(n), color=TEXT, fontsize=7, va="top", clip_on=True))
+                self.span_artists.append(self.ax.text(clip.start, -2, str(int(row.num_label.cget("text"))), color=TEXT, fontsize=7, va="top", clip_on=True))
         self.canvas.draw_idle()
 
     def _on_wave_click(self, event):
         if self.smooth is None or event.inaxes is not self.ax or event.xdata is None: return
         t = float(event.xdata)
-        for clip in self.clips:
-            if clip.start <= t <= clip.end: self.preview(clip.start, clip.end); return
+        for row in self.rows:
+            if row.clip.start <= t <= row.clip.end: self._preview_row(row); return
         self.preview(max(0.0, t - 2), min(self.duration, t + 13))
 
     # --- PREVIEW ---
     def preview(self, start, end):
         if not self.video_path: return
         self._stop_preview()
-        cmd = ["ffplay", "-hide_banner", "-loglevel", "error", "-autoexit", "-x", "960", "-y", "540",
+        cmd = [tool("ffplay"), "-hide_banner", "-loglevel", "error", "-autoexit", "-x", "960", "-y", "540",
                "-window_title", f"Preview {fmt_time(start)} - {fmt_time(end)}",
                "-ss", f"{start:.2f}", "-t", f"{end - start:.2f}", self.video_path]
         try: self.preview_proc = start_process(cmd)
@@ -840,31 +1058,75 @@ class HighlightScout:
         src = self.video_path
 
         def work(progress):
-            failures = []
+            failures, exported = [], []
             for i, (clip, out) in enumerate(jobs):
                 name = os.path.basename(out)
                 progress(i / len(jobs), f"RENDERING {i + 1}/{len(jobs)}: {name}")
                 error = run_export(build_export_cmd(src, clip, out, mode), out, clip.end - clip.start,
                                    lambda f: progress((i + f) / len(jobs)), self.cancel_event)
                 if error: failures.append(f"{name}:\n{error}")
-            return failures
+                else: exported.append(out)
+            return failures, exported
 
-        def done(failures):
-            exported = len(jobs) - len(failures)
-            self.status_label.configure(text=f"EXPORTED {exported}/{len(jobs)}")
+        def done(result):
+            failures, exported = result
+            self.status_label.configure(text=f"EXPORTED {len(exported)}/{len(jobs)}")
             if failures:
                 log_error("\n\n".join(failures))
-                self._show_error(f"Exported {exported} of {len(jobs)} clips. These failed:\n\n" + "\n\n".join(failures[:3])
+                self._show_error(f"Exported {len(exported)} of {len(jobs)} clips. These failed:\n\n" + "\n\n".join(failures[:3])
                                  + (f"\n\n...and {len(failures) - 3} more" if len(failures) > 3 else ""))
-            if exported and messagebox.askyesno("Done", f"Exported {exported} clip(s) to:\n{out_dir}\n\nOpen the folder?", parent=self.root):
-                os.startfile(out_dir)
+            if exported:
+                self.last_export_dir = out_dir
+                choice = self._ask(f"Exported {len(exported)} clip(s) to:\n{out_dir}", "Done",
+                                   ["Close:secondary", "Open folder:secondary", "Send to Caption Studio:primary"])
+                if choice == "Open folder": os.startfile(out_dir)
+                elif choice == "Send to Caption Studio": self.open_caption_studio(exported[0])
 
         self._run_in_background("RENDERING...", work, done)
+
+    # --- BONES' CAPTION STUDIO ---
+    def open_caption_studio(self, clip_path=None):
+        """Starts Caption Studio if it's installed, and opens the clips folder beside it so a clip can be dragged in.
+        If it isn't installed, offers the download instead."""
+        self.root.configure(cursor="watch"); self.root.update_idletasks()
+        try: exe = find_caption_studio(self.settings["caption_studio_path"])
+        finally: self.root.configure(cursor="")
+        if exe is None: self._offer_caption_studio(); return
+
+        # Caption Studio ignores the extra argument today; it's passed so a future version can open the clip directly.
+        try: subprocess.Popen([exe] + ([clip_path] if clip_path else []), cwd=os.path.dirname(exe))
+        except OSError as e: self._show_error(f"Couldn't start {CAPTION_STUDIO_NAME}:\n\n{e}"); return
+        self.settings["caption_studio_path"] = exe
+        folder = self.last_export_dir or self.out_var.get().strip()
+        if folder and os.path.isdir(folder):
+            os.startfile(folder)
+            self.status_label.configure(text="CAPTION STUDIO OPENED · DRAG A CLIP INTO IT")
+        else:
+            self.status_label.configure(text="CAPTION STUDIO OPENED")
+
+    def _offer_caption_studio(self):
+        choice = self._ask(f"{CAPTION_STUDIO_NAME} isn't installed on this PC.\n\n{CAPTION_STUDIO_PITCH}", CAPTION_STUDIO_NAME,
+                           ["Close:secondary", "I already have it...:secondary", "Get it:primary"])
+        if choice == "Get it":
+            if CAPTION_STUDIO_URL: webbrowser.open(CAPTION_STUDIO_URL)
+            else: self._show_info(f"The {CAPTION_STUDIO_NAME} download link is coming soon.")
+        elif choice == "I already have it...":
+            exe = filedialog.askopenfilename(title=f"Find {CAPTION_STUDIO_EXE}",
+                                             filetypes=[(CAPTION_STUDIO_NAME, CAPTION_STUDIO_EXE), ("Programs", "*.exe")])
+            if exe:
+                self.settings["caption_studio_path"] = exe
+                self.open_caption_studio()
 
     # --- MESSAGES ---
     def _show_info(self, message): Messagebox.show_info(message, "Bones Highlight Scout", parent=self.root)
     def _show_warning(self, message): Messagebox.show_warning(message, "Bones Highlight Scout", parent=self.root)
     def _show_error(self, message): Messagebox.show_error(message, "Bones Highlight Scout", parent=self.root)
+
+    def _ask(self, message, title, buttons):
+        """Themed dialog with custom buttons ("Text:bootstyle"); returns the clicked button's text or None."""
+        dialog = MessageDialog(message, title=title, buttons=buttons, parent=self.root, default=buttons[-1].split(":")[0])
+        dialog.show()
+        return dialog.result
 
     def _on_tk_error(self, exc, value, tb_):
         details = "".join(traceback.format_exception(exc, value, tb_)); log_error(details)
@@ -880,6 +1142,7 @@ class HighlightScout:
     def _on_close(self):
         self.cancel()
         self._stop_preview()
+        self._save_session_now()
         self.settings.update({
             "detect_mode": self.detect_var.get(),
             "threshold_db": round(float(self.threshold_var.get()), 1),
