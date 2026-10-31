@@ -19,16 +19,22 @@ import traceback
 from dataclasses import dataclass
 
 import tkinter as tk
+import tkinter.font
 from tkinter import filedialog, messagebox
 
 import numpy as np
 import ttkbootstrap as tb
 from ttkbootstrap.constants import *
 from ttkbootstrap.dialogs import Messagebox
+from ttkbootstrap.style import ThemeDefinition
 from ttkbootstrap.widgets.scrolled import ScrolledFrame
 from matplotlib.figure import Figure
 from matplotlib.ticker import FuncFormatter
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+try:
+    from tkinterdnd2 import TkinterDnD, DND_FILES   # optional: drag-and-drop loading
+except ImportError:
+    TkinterDnD = None
 
 # --- DPI FIX ---
 if platform.system() == "Windows":
@@ -43,9 +49,42 @@ SMOOTH_SECONDS = 0.5        # pops shorter than this don't count as highlights
 BASELINE_SECONDS = 30       # what "normal" loudness means in spike mode
 DB_FLOOR = -60.0
 
-PLOT_BG = "#2b2b2b"
-WAVE_GREEN = "#28a745"
-UNSELECTED_GREY = "#777777"
+# --- BONES THEME ---
+# Same palette as Bones Caption Studio and Bones' Sound Check: dark grays with a teal accent,
+# switching to blue in colorblind mode.
+WINDOW_BG = "#121212"
+PANEL_BG = "#1E1E1E"
+PANEL_BORDER = "#2D2D2D"
+INPUT_BG = "#151515"
+BUTTON_BG = "#2D2D2D"
+BUTTON_BORDER = "#3D3D3D"
+BUTTON_PRESSED = "#222831"
+TEXT = "#E0E0E0"
+TEXT_MUTED = "#888888"
+TEXT_DISABLED = "#555555"
+FONT = ("Segoe UI", 10)
+FONT_BOLD = ("Segoe UI", 10, "bold")
+FONT_SMALL = ("Segoe UI", 8)
+
+PALETTES = {
+    False: {"accent": "#00ADB5", "accent_hover": "#00FFF5", "accent_dim": "#1A3A3A", "on_accent": "#121212",
+            "danger_text": "#FF5A5A", "danger_hover": "#3A1E1E",
+            "good": "#4CAF50", "warn": "#FFC107", "problem": "#F44336"},
+    True:  {"accent": "#1565C0", "accent_hover": "#1976D2", "accent_dim": "#1A2A3F", "on_accent": "#FFFFFF",
+            "danger_text": "#FFFFFF", "danger_hover": "#D32F2F",
+            "good": "#42A5F5", "warn": "#FFD54F", "problem": "#FF7043"},
+}
+
+def theme_name(colorblind):
+    return "bones_colorblind" if colorblind else "bones"
+
+def theme_colors(colorblind):
+    p = PALETTES[colorblind]
+    return {"primary": p["accent"], "secondary": BUTTON_BG, "success": p["good"], "info": p["accent_hover"],
+            "warning": p["warn"], "danger": p["problem"], "light": TEXT, "dark": PANEL_BG,
+            # selectbg also fills read-only dropdowns, so it stays gray rather than accent.
+            "bg": PANEL_BG, "fg": TEXT, "selectbg": BUTTON_BG, "selectfg": TEXT,
+            "border": PANEL_BORDER, "inputfg": TEXT, "inputbg": INPUT_BG, "active": BUTTON_BORDER}
 
 APP_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "BonesHighlightScout")
 SETTINGS_PATH = os.path.join(APP_DIR, "settings.json")
@@ -76,6 +115,7 @@ DEFAULT_SETTINGS = {
     "max_clips": 20,
     "export_mode": "Accurate (re-encode)",
     "last_dir": "",
+    "colorblind": False,
 }
 
 
@@ -331,6 +371,11 @@ class HighlightScout:
     def __init__(self):
         self.settings = load_settings()
         self.root = tb.Window(themename="darkly")
+        self.style = self.root.style
+        for colorblind in (False, True):
+            self.style.register_theme(ThemeDefinition(theme_name(colorblind), theme_colors(colorblind), "dark"))
+        self.colorblind_var = tk.BooleanVar(value=self.settings["colorblind"])
+        self.palette = PALETTES[self.colorblind_var.get()]
         self.root.title(f"Bones Highlight Scout v{APP_VERSION}")
         self.root.geometry("1280x780"); self.root.minsize(1000, 640)
         self.root.report_callback_exception = self._on_tk_error
@@ -349,10 +394,48 @@ class HighlightScout:
         self.span_artists = []
         self.limit_line = None
 
+        self.dnd_enabled = self._load_drag_and_drop()
+        self._apply_theme(redraw=False)
         self._build_ui()
+        self._register_drop_targets()
         self._poll_queue()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(300, self._check_tools)
+
+    # --- THEME ---
+    def _apply_theme(self, redraw=True):
+        colorblind = self.colorblind_var.get()
+        self.palette = p = PALETTES[colorblind]
+        s = self.style
+        s.theme_use(theme_name(colorblind))
+        self.root.configure(background=WINDOW_BG)
+        for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont"): tk.font.nametofont(name).configure(family=FONT[0], size=FONT[1])
+
+        # Custom styles live per theme, so they're (re)applied after every switch.
+        s.configure("TLabelframe", background=PANEL_BG, bordercolor=PANEL_BORDER, lightcolor=PANEL_BG, darkcolor=PANEL_BG)
+        s.configure("TLabelframe.Label", background=PANEL_BG, foreground=p["accent"], font=FONT_BOLD)
+        s.configure("Panel.TFrame", background=PANEL_BG, bordercolor=PANEL_BORDER)
+        s.configure("Muted.TLabel", background=PANEL_BG, foreground=TEXT_MUTED, font=FONT_SMALL)
+        s.configure("Status.TLabel", background=PANEL_BG, foreground=p["accent"], font=FONT_BOLD)
+
+        def button(name, bg, fg, border, hover_bg, hover_fg, hover_border, disabled_bg, disabled_fg, disabled_border):
+            s.configure(name, background=bg, foreground=fg, bordercolor=border, lightcolor=bg, darkcolor=bg,
+                        focuscolor=fg, focusthickness=0, font=FONT_BOLD, padding=(12, 6), relief=FLAT)
+            s.map(name,
+                  background=[("disabled", disabled_bg), ("pressed", BUTTON_PRESSED), ("active", hover_bg)],
+                  foreground=[("disabled", disabled_fg), ("active", hover_fg)],
+                  bordercolor=[("disabled", disabled_border), ("active", hover_border)],
+                  lightcolor=[("disabled", disabled_bg), ("pressed", BUTTON_PRESSED), ("active", hover_bg)],
+                  darkcolor=[("disabled", disabled_bg), ("pressed", BUTTON_PRESSED), ("active", hover_bg)])
+        # Regular buttons: dark gray with accent text. Main actions: solid accent. Delete/Cancel: red text.
+        button("Bones.TButton", BUTTON_BG, p["accent"], BUTTON_BORDER, BUTTON_BORDER, p["accent"], p["accent"], INPUT_BG, TEXT_DISABLED, "#222222")
+        button("BonesAccent.TButton", p["accent"], "#EEEEEE", p["accent"], p["accent_hover"], p["on_accent"], p["accent_hover"], p["accent_dim"], "#666666", p["accent_dim"])
+        button("BonesDanger.TButton", "#252525", p["danger_text"], BUTTON_BORDER, p["danger_hover"], "#FFFFFF", "#FF5A5A", INPUT_BG, TEXT_DISABLED, "#222222")
+        s.configure("Bones.TButton", padding=(10, 4))
+        s.configure("BonesDanger.TButton", padding=(10, 4))
+
+        if redraw:
+            self._draw_waveform()
 
     # --- UI BUILD ---
     def _build_ui(self):
@@ -360,10 +443,11 @@ class HighlightScout:
         root.columnconfigure(0, weight=3); root.columnconfigure(1, weight=1)
         root.rowconfigure(0, weight=1)
 
-        review = tb.LabelFrame(root, text="REVIEW_CHAMBER"); review.grid(row=0, column=0, padx=(10, 5), pady=10, sticky="nsew")
-        params = tb.LabelFrame(root, text="SLICE_PARAMETERS"); params.grid(row=0, column=1, padx=(5, 10), pady=10, sticky="nsew")
-        wave = tb.LabelFrame(root, text="THE_WAVEFORM_MAP  (click to preview)"); wave.grid(row=1, column=0, columnspan=2, padx=10, pady=(0, 10), sticky="ew")
-        bar = tb.Frame(root); bar.grid(row=2, column=0, columnspan=2, padx=10, pady=(0, 10), sticky="ew")
+        review = tb.Labelframe(root, text="REVIEW_CHAMBER", padding=6); review.grid(row=0, column=0, padx=(12, 6), pady=12, sticky="nsew")
+        params = tb.Labelframe(root, text="SLICE_PARAMETERS", padding=6); params.grid(row=0, column=1, padx=(6, 12), pady=12, sticky="nsew")
+        wave = tb.Labelframe(root, text="THE_WAVEFORM_MAP  (click to preview)", padding=6); wave.grid(row=1, column=0, columnspan=2, padx=12, pady=(0, 12), sticky="ew")
+        bar = tb.Frame(root, style="Panel.TFrame", padding=8); bar.grid(row=2, column=0, columnspan=2, padx=12, pady=(0, 12), sticky="ew")
+        self.panels = (review, params, wave, bar)
 
         self._build_params(params)
         self._build_review(review)
@@ -378,7 +462,7 @@ class HighlightScout:
         def changed(v):
             value_label.config(text=fmt(float(v)))
             if on_change: on_change()
-        scale = tb.Scale(parent, from_=from_, to=to, variable=var, command=changed, bootstyle="success")
+        scale = tb.Scale(parent, from_=from_, to=to, variable=var, command=changed, bootstyle="primary")
         scale.pack(fill=X, padx=10, pady=(2, 4))
         return var, scale
 
@@ -386,10 +470,10 @@ class HighlightScout:
         s = self.settings
         tb.Label(parent, text="DETECTION").pack(anchor="w", padx=10, pady=(10, 0))
         self.detect_var = tk.StringVar(value=s["detect_mode"])
-        combo = tb.Combobox(parent, textvariable=self.detect_var, values=list(DETECT_MODES), state="readonly", bootstyle="success")
+        combo = tb.Combobox(parent, textvariable=self.detect_var, values=list(DETECT_MODES), state="readonly", bootstyle="primary")
         combo.pack(fill=X, padx=10, pady=4)
         combo.bind("<<ComboboxSelected>>", lambda e: self._on_detect_mode_changed())
-        self.detect_hint = tb.Label(parent, text="", font=("Segoe UI", 8), foreground="#999999", wraplength=260, justify=LEFT)
+        self.detect_hint = tb.Label(parent, text="", style="Muted.TLabel", wraplength=260, justify=LEFT)
         self.detect_hint.pack(anchor="w", padx=10)
 
         self.threshold_var, _ = self._slider(parent, "dB_THRESHOLD", -60, 0, s["threshold_db"], lambda v: f"{v:.1f}dB", self._update_limit_line)
@@ -398,37 +482,38 @@ class HighlightScout:
         self.post_var, _ = self._slider(parent, "POST_ROLL (after)", 0, 120, s["post_roll"], lambda v: f"{int(v)}s")
         self.max_var, _ = self._slider(parent, "MAX_CLIPS", 1, 100, s["max_clips"], lambda v: f"{int(v)}")
 
-        self.scan_btn = tb.Button(parent, text="SCAN", bootstyle="success", command=self.scan)
+        self.scan_btn = tb.Button(parent, text="SCAN", style="BonesAccent.TButton", command=self.scan)
         self.scan_btn.pack(fill=X, padx=10, pady=(14, 10))
         self._on_detect_mode_changed()
 
     def _build_review(self, parent):
         header = tb.Frame(parent); header.pack(fill=X, padx=8, pady=(8, 4))
-        self.toggle_btn = tb.Button(header, text="SELECT ALL", bootstyle="success-outline", command=self.toggle_all)
+        self.toggle_btn = tb.Button(header, text="SELECT ALL", style="Bones.TButton", command=self.toggle_all)
         self.toggle_btn.pack(side=LEFT)
         self.count_label = tb.Label(header, text=""); self.count_label.pack(side=LEFT, padx=12)
-        tb.Label(header, text="Times accept 83, 1:23 or 1:02:03", font=("Segoe UI", 8), foreground="#999999").pack(side=RIGHT)
+        tb.Label(header, text="Times accept 83, 1:23 or 1:02:03", style="Muted.TLabel").pack(side=RIGHT)
 
         self.list_frame = ScrolledFrame(parent, autohide=True)
         self.list_frame.pack(fill=BOTH, expand=YES, padx=8)
-        self.empty_label = tb.Label(self.list_frame, text="Load a video, then press SCAN.", foreground="#999999")
+        hint = "Drop a video anywhere in this window (or click LOAD VIDEO), then press SCAN." if self.dnd_enabled else "Load a video, then press SCAN."
+        self.empty_label = tb.Label(self.list_frame, text=hint, foreground=TEXT_MUTED)
         self.empty_label.pack(pady=40)
 
         footer = tb.Frame(parent); footer.pack(fill=X, padx=8, pady=8)
         footer.columnconfigure(3, weight=1)
         tb.Label(footer, text="EXPORT").grid(row=0, column=0, padx=(0, 6))
         self.export_var = tk.StringVar(value=self.settings["export_mode"])
-        tb.Combobox(footer, textvariable=self.export_var, values=list(EXPORT_MODES), state="readonly", width=26, bootstyle="success").grid(row=0, column=1, padx=(0, 12))
+        tb.Combobox(footer, textvariable=self.export_var, values=list(EXPORT_MODES), state="readonly", width=26, bootstyle="primary").grid(row=0, column=1, padx=(0, 12))
         tb.Label(footer, text="TO").grid(row=0, column=2, padx=(0, 6))
         self.out_var = tk.StringVar()
-        tb.Entry(footer, textvariable=self.out_var, bootstyle="success").grid(row=0, column=3, sticky="ew")
-        tb.Button(footer, text="...", bootstyle="secondary-outline", width=3, command=self.choose_output_dir).grid(row=0, column=4, padx=6)
-        self.render_btn = tb.Button(footer, text="RENDER SELECTED", bootstyle="success", command=self.render)
+        tb.Entry(footer, textvariable=self.out_var, bootstyle="primary").grid(row=0, column=3, sticky="ew")
+        tb.Button(footer, text="...", style="Bones.TButton", width=3, command=self.choose_output_dir).grid(row=0, column=4, padx=6)
+        self.render_btn = tb.Button(footer, text="RENDER SELECTED", style="BonesAccent.TButton", command=self.render)
         self.render_btn.grid(row=0, column=5)
 
     def _build_waveform(self, parent):
-        self.fig = Figure(figsize=(10, 2.1), dpi=100, facecolor=PLOT_BG)
-        self.fig.subplots_adjust(left=0.05, right=0.99, top=0.94, bottom=0.17)
+        self.fig = Figure(figsize=(10, 2.1), dpi=100, facecolor=PANEL_BG)
+        self.fig.subplots_adjust(left=0.05, right=0.975, top=0.94, bottom=0.17)
         self.ax = self.fig.add_subplot(111)
         self.canvas = FigureCanvasTkAgg(self.fig, master=parent)
         self.canvas.get_tk_widget().pack(fill=BOTH, expand=YES)
@@ -437,14 +522,16 @@ class HighlightScout:
 
     def _build_bottom_bar(self, bar):
         bar.columnconfigure(1, weight=1)
-        self.load_btn = tb.Button(bar, text="LOAD VIDEO", bootstyle="success-outline", command=self.load_video)
+        self.load_btn = tb.Button(bar, text="LOAD VIDEO", style="Bones.TButton", command=self.load_video)
         self.load_btn.grid(row=0, column=0, padx=(0, 10))
-        self.file_label = tb.Label(bar, text="No video loaded", foreground="#999999"); self.file_label.grid(row=0, column=1, sticky="w")
-        self.status_label = tb.Label(bar, text="IDLE", font=("Segoe UI", 8)); self.status_label.grid(row=0, column=2, padx=10)
-        self.progress_bar = tb.Progressbar(bar, bootstyle="success-striped", mode="determinate", length=260, maximum=1.0)
+        self.file_label = tb.Label(bar, text="No video loaded", foreground=TEXT_MUTED); self.file_label.grid(row=0, column=1, sticky="w")
+        self.status_label = tb.Label(bar, text="IDLE", style="Status.TLabel"); self.status_label.grid(row=0, column=2, padx=10)
+        self.progress_bar = tb.Progressbar(bar, bootstyle="primary", mode="determinate", length=260, maximum=1.0)
         self.progress_bar.grid(row=0, column=3, padx=(0, 10))
-        self.cancel_btn = tb.Button(bar, text="CANCEL", bootstyle="danger-outline", command=self.cancel, state=DISABLED)
+        self.cancel_btn = tb.Button(bar, text="CANCEL", style="BonesDanger.TButton", command=self.cancel, state=DISABLED)
         self.cancel_btn.grid(row=0, column=4)
+        tb.Checkbutton(bar, text="Colorblind mode", variable=self.colorblind_var, bootstyle="primary",
+                       command=self._apply_theme).grid(row=0, column=5, padx=(16, 0))
 
     # --- BACKGROUND WORK ---
     def _poll_queue(self):
@@ -494,10 +581,46 @@ class HighlightScout:
         self.cancel_event.set()
         kill_all_processes()
 
+    # --- DRAG AND DROP ---
+    def _load_drag_and_drop(self):
+        if TkinterDnD is None: return False
+        try: TkinterDnD._require(self.root)
+        except (RuntimeError, tk.TclError): return False
+        return True
+
+    def _register_drop_targets(self):
+        if not self.dnd_enabled: return
+        # Windows hands a drop to the nearest registered parent, so the four panels cover the whole window.
+        for panel in self.panels:
+            panel.drop_target_register(DND_FILES)
+            panel.dnd_bind("<<DropEnter>>", self._on_drag_enter)
+            panel.dnd_bind("<<DropLeave>>", self._on_drag_leave)
+            panel.dnd_bind("<<Drop>>", self._on_drop)
+
+    def _on_drag_enter(self, event):
+        if not self.busy:
+            self._status_before_drag = self.status_label.cget("text")
+            self.status_label.configure(text="DROP TO LOAD VIDEO")
+        return event.action
+
+    def _on_drag_leave(self, event):
+        if not self.busy and getattr(self, "_status_before_drag", None):
+            self.status_label.configure(text=self._status_before_drag)
+        return event.action
+
+    def _on_drop(self, event):
+        self._on_drag_leave(event)
+        files = [p for p in self.root.tk.splitlist(event.data) if os.path.isfile(p)]
+        if self.busy: self._show_warning("Wait for the current job to finish (or press CANCEL) first.")
+        elif not files: self._show_warning("That isn't a file. Drop a video file to load it.")
+        else: self.load_video(files[0])
+        return event.action
+
     # --- LOAD ---
-    def load_video(self):
+    def load_video(self, path=None):
         if self.busy: return
-        path = filedialog.askopenfilename(title="Choose a video", filetypes=VIDEO_TYPES, initialdir=self.settings["last_dir"] or None)
+        if path is None:
+            path = filedialog.askopenfilename(title="Choose a video", filetypes=VIDEO_TYPES, initialdir=self.settings["last_dir"] or None)
         if not path: return
         self.settings["last_dir"] = os.path.dirname(path)
         self._stop_preview()
@@ -516,7 +639,7 @@ class HighlightScout:
             self.video_path = path
             stem = os.path.splitext(os.path.basename(path))[0]
             self.out_var.set(os.path.join(os.path.dirname(path), f"{stem}_clips"))
-            self.file_label.configure(text=f"{os.path.basename(path)}  ({fmt_time(self.duration)})", foreground="")
+            self.file_label.configure(text=f"{os.path.basename(path)}  ({fmt_time(self.duration)})", foreground=TEXT)
             self._set_clips([])
             self._draw_waveform()
             self.status_label.configure(text="READY TO SCAN")
@@ -562,17 +685,17 @@ class HighlightScout:
         start_var = tk.StringVar(value=fmt_time(clip.start))
         end_var = tk.StringVar(value=fmt_time(clip.end))
 
-        tb.Checkbutton(frame, variable=sel_var, bootstyle="success-round-toggle").pack(side=LEFT, padx=(4, 6))
-        tb.Label(frame, text=f"{number:02d}", width=3, foreground="#999999").pack(side=LEFT)
-        tb.Entry(frame, textvariable=title_var, bootstyle="success").pack(side=LEFT, fill=X, expand=YES, padx=(4, 8))
-        start_entry = tb.Entry(frame, textvariable=start_var, width=8, justify=CENTER, bootstyle="success"); start_entry.pack(side=LEFT)
+        tb.Checkbutton(frame, variable=sel_var, bootstyle="primary-round-toggle").pack(side=LEFT, padx=(4, 6))
+        tb.Label(frame, text=f"{number:02d}", width=3, foreground=TEXT_MUTED).pack(side=LEFT)
+        tb.Entry(frame, textvariable=title_var, bootstyle="primary").pack(side=LEFT, fill=X, expand=YES, padx=(4, 8))
+        start_entry = tb.Entry(frame, textvariable=start_var, width=8, justify=CENTER, bootstyle="primary"); start_entry.pack(side=LEFT)
         tb.Label(frame, text="–").pack(side=LEFT, padx=3)
-        end_entry = tb.Entry(frame, textvariable=end_var, width=8, justify=CENTER, bootstyle="success"); end_entry.pack(side=LEFT)
-        length_label = tb.Label(frame, text="", width=6, foreground="#999999"); length_label.pack(side=LEFT, padx=6)
+        end_entry = tb.Entry(frame, textvariable=end_var, width=8, justify=CENTER, bootstyle="primary"); end_entry.pack(side=LEFT)
+        length_label = tb.Label(frame, text="", width=6, foreground=TEXT_MUTED); length_label.pack(side=LEFT, padx=6)
 
         row = ClipRow(clip, frame, sel_var, title_var, start_var, end_var, start_entry, end_entry, length_label)
-        tb.Button(frame, text="DELETE", bootstyle="danger-outline", command=lambda: self._delete_row(row)).pack(side=RIGHT, padx=(4, 0))
-        tb.Button(frame, text="PREVIEW", bootstyle="success-outline", command=lambda: self._preview_row(row)).pack(side=RIGHT, padx=(4, 0))
+        tb.Button(frame, text="DELETE", style="BonesDanger.TButton", command=lambda: self._delete_row(row)).pack(side=RIGHT, padx=(4, 0))
+        tb.Button(frame, text="PREVIEW", style="Bones.TButton", command=lambda: self._preview_row(row)).pack(side=RIGHT, padx=(4, 0))
 
         # Traces keep the clip in sync on every keystroke, so nothing typed is lost when you click straight to RENDER.
         sel_var.trace_add("write", lambda *_: self._on_select_changed(row))
@@ -585,7 +708,7 @@ class HighlightScout:
     def _on_time_edited(self, row):
         start, end = parse_time(row.start_var.get()), parse_time(row.end_var.get())
         row.valid = start is not None and end is not None and start < end and end <= self.duration + 0.5
-        style = "success" if row.valid else "danger"
+        style = "primary" if row.valid else "danger"
         row.start_entry.configure(bootstyle=style); row.end_entry.configure(bootstyle=style)
         if row.valid:
             # Leave the precise detected time alone unless the user actually changed the shown value.
@@ -623,12 +746,13 @@ class HighlightScout:
     # --- WAVEFORM ---
     def _style_axes(self):
         ax = self.ax
-        ax.set_facecolor(PLOT_BG)
+        self.fig.set_facecolor(PANEL_BG)
+        ax.set_facecolor(INPUT_BG)
         ax.set_ylim(DB_FLOOR, 0)
-        ax.tick_params(colors="#888888", labelsize=8)
+        ax.tick_params(colors=TEXT_MUTED, labelsize=8)
         for side in ("top", "right"): ax.spines[side].set_visible(False)
-        for side in ("left", "bottom"): ax.spines[side].set_color("#555555")
-        ax.set_ylabel("dB", color="#888888", fontsize=8)
+        for side in ("left", "bottom"): ax.spines[side].set_color(BUTTON_BORDER)
+        ax.set_ylabel("dB", color=TEXT_MUTED, fontsize=8)
         ax.xaxis.set_major_formatter(FuncFormatter(lambda x, _: fmt_time(x)))
 
     def _draw_waveform(self):
@@ -637,7 +761,7 @@ class HighlightScout:
         self.span_artists = []; self.limit_line = None
         if self.smooth is None:
             ax.set_xlim(0, 60)
-            ax.text(30, -30, "No video loaded", color="#777777", ha="center", va="center")
+            ax.text(30, -30, "Drop a video here" if self.dnd_enabled else "No video loaded", color=TEXT_MUTED, ha="center", va="center")
             self.canvas.draw_idle(); return
 
         # Shrink to ~4000 points for drawing: the loudest value per bin, so short peaks still show.
@@ -648,8 +772,8 @@ class HighlightScout:
         self.disp_base = np.add.reduceat(self.base, starts) / widths
         loudness = np.maximum.reduceat(self.smooth, starts)
 
-        ax.fill_between(self.disp_t, DB_FLOOR, loudness, color=WAVE_GREEN, alpha=0.85, linewidth=0)
-        self.limit_line, = ax.plot(self.disp_t, self.disp_base, color="white", linestyle="--", linewidth=1.2, alpha=0.85)
+        ax.fill_between(self.disp_t, DB_FLOOR, loudness, color=self.palette["accent"], alpha=0.9, linewidth=0)
+        self.limit_line, = ax.plot(self.disp_t, self.disp_base, color=TEXT, linestyle="--", linewidth=1.2, alpha=0.85)
         ax.set_xlim(0, self.duration)
         self._update_limit_line()
         self._draw_clip_spans()
@@ -665,9 +789,9 @@ class HighlightScout:
         self.span_artists = []
         if self.smooth is not None:
             for n, clip in enumerate(self.clips, 1):
-                color = WAVE_GREEN if clip.selected else UNSELECTED_GREY
-                self.span_artists.append(self.ax.axvspan(clip.start, clip.end, color=color, alpha=0.3 if clip.selected else 0.15, linewidth=0))
-                self.span_artists.append(self.ax.text(clip.start, -2, str(n), color="white", fontsize=7, va="top", clip_on=True))
+                color = self.palette["accent_hover"] if clip.selected else TEXT_MUTED
+                self.span_artists.append(self.ax.axvspan(clip.start, clip.end, color=color, alpha=0.18 if clip.selected else 0.1, linewidth=0))
+                self.span_artists.append(self.ax.text(clip.start, -2, str(n), color=TEXT, fontsize=7, va="top", clip_on=True))
         self.canvas.draw_idle()
 
     def _on_wave_click(self, event):
@@ -764,6 +888,7 @@ class HighlightScout:
             "post_roll": float(round(self.post_var.get())),
             "max_clips": int(round(self.max_var.get())),
             "export_mode": self.export_var.get(),
+            "colorblind": self.colorblind_var.get(),
         })
         save_settings(self.settings)
         self.root.destroy()
