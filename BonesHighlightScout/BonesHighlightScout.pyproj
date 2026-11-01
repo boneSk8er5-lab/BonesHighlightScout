@@ -22,11 +22,15 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="BonesHighlightScout.py" />
+    <Compile Include="hype.py" />
   </ItemGroup>
   <ItemGroup>
     <Content Include="requirements.txt" />
     <Content Include="HighlightScout.ico" />
     <Content Include="HighlightScout.png" />
+    <Content Include="models\yamnet.onnx" />
+    <Content Include="models\yamnet_class_map.csv" />
+    <Content Include="models\yamnet_LICENSE.txt" />
   </ItemGroup>
   <Import Project="$(MSBuildExtensionsPath32)\Microsoft\VisualStudio\v$(VisualStudioVersion)\Python Tools\Microsoft.PythonTools.targets" />
   <!-- Uncomment the CoreCompile target to enable the Build command in

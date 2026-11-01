@@ -2,7 +2,7 @@
 rem Starts Bones Highlight Scout, installing missing Python packages first.
 cd /d "%~dp0BonesHighlightScout"
 
-python -c "import ttkbootstrap, numpy, matplotlib, tkinterdnd2" 2>nul
+python -c "import ttkbootstrap, numpy, matplotlib, tkinterdnd2, onnxruntime, faster_whisper" 2>nul
 if errorlevel 1 (
     echo Installing required Python packages...
     python -m pip install -r requirements.txt

@@ -19,7 +19,7 @@ import tempfile
 import threading
 import traceback
 import webbrowser
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 
 import tkinter as tk
 import tkinter.font
@@ -39,6 +39,8 @@ try:
 except ImportError:
     TkinterDnD = None
 
+import hype
+
 # --- DPI FIX / TASKBAR ICON ---
 if platform.system() == "Windows":
     try: ctypes.windll.shcore.SetProcessDpiAwareness(1)
@@ -49,8 +51,9 @@ if platform.system() == "Windows":
 
 # --- CONSTANTS ---
 APP_VERSION = "3.0.0"
-ANALYSIS_RATE = 8000        # Hz. Plenty for loudness, and keeps hour-long VODs small in memory
+ANALYSIS_RATE = hype.SAMPLE_RATE   # 16 kHz: what the reaction model needs; loudness comes from the same pass
 HOP_SECONDS = 0.05          # one loudness reading every 50 ms
+HYPE_MIN_STRENGTH = 0.5     # how much has to be going on before a moment counts in Hype mode
 SMOOTH_SECONDS = 0.5        # pops shorter than this don't count as highlights
 BASELINE_SECONDS = 30       # what "normal" loudness means in spike mode
 DB_FLOOR = -60.0
@@ -96,6 +99,8 @@ APP_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "Bone
 SETTINGS_PATH = os.path.join(APP_DIR, "settings.json")
 ERROR_LOG_PATH = os.path.join(APP_DIR, "error.log")
 SESSIONS_DIR = os.path.join(APP_DIR, "sessions")
+SPEECH_DIR = os.path.join(APP_DIR, "speech")          # cached transcripts, one per video
+WHISPER_DIR = os.path.join(APP_DIR, "models")         # the speech model downloads here the first time
 ICON_FILE = "HighlightScout.ico"
 
 CAPTION_STUDIO_NAME = "Bones' Caption Studio"
@@ -107,10 +112,12 @@ NO_WINDOW = subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0
 
 VIDEO_TYPES = [("Video files", "*.mp4 *.mkv *.mov *.avi *.webm *.flv *.m4v *.ts"), ("All files", "*.*")]
 DETECT_MODES = {
+    "Hype moments (AI)": "hype",
     "Sudden spikes": "spike",
     "Loud moments": "loud",
 }
 DETECT_HINTS = {
+    "hype": "Finds reactions: laughter, screams, hype phrases and chat spikes. Tags show why.",
     "spike": "Finds moments much louder than the 30s around them (and above the threshold). Best for gameplay with music.",
     "loud": "Finds anything louder than the threshold.",
 }
@@ -121,7 +128,8 @@ EXPORT_MODES = {
     "Vertical 9:16 (center crop)": "vertical_crop",
 }
 DEFAULT_SETTINGS = {
-    "detect_mode": "Sudden spikes",
+    "detect_mode": "Hype moments (AI)",
+    "listen_speech": True,
     "threshold_db": -35.0,
     "jump_db": 8.0,
     "pre_roll": 20.0,
@@ -150,6 +158,7 @@ class Clip:
     score: float
     title: str = ""
     selected: bool = True
+    tags: list = field(default_factory=list)   # why it was picked, e.g. LAUGHTER, "NO WAY", CHAT x6
 
 
 # --- HELPERS ---
@@ -239,7 +248,7 @@ def load_session(video_path, duration):
     try:
         with open(path, encoding="utf-8") as f: saved = json.load(f)["clips"]
         clips = [Clip(start=float(c["start"]), end=float(c["end"]), peak=float(c["peak"]), score=float(c["score"]),
-                      title=str(c["title"]), selected=bool(c["selected"])) for c in saved]
+                      title=str(c["title"]), selected=bool(c["selected"]), tags=[str(t) for t in c.get("tags", [])]) for c in saved]
     except (OSError, TypeError, ValueError, KeyError): return []
     return [c for c in clips if 0 <= c.start < c.end <= duration + 0.5]
 
@@ -356,8 +365,9 @@ def probe_video(path):
     has_audio = any(s.get("codec_type") == "audio" for s in info.get("streams", []))
     return duration, has_audio
 
-def analyze_audio(path, duration, progress, cancel_event):
-    """Streams the audio out of ffmpeg and returns its loudness in dB, one value per HOP_SECONDS."""
+def analyze_audio(path, duration, progress, cancel_event, on_samples=None):
+    """Streams the audio out of ffmpeg and returns its loudness in dB, one value per HOP_SECONDS.
+    on_samples(audio) also gets every piece of 16 kHz audio (the reaction detector listens along)."""
     hop = int(ANALYSIS_RATE * HOP_SECONDS)
     cmd = [tool("ffmpeg"), "-hide_banner", "-nostdin", "-v", "error", "-i", path,
            "-vn", "-ac", "1", "-ar", str(ANALYSIS_RATE), "-f", "s16le", "-"]
@@ -371,7 +381,9 @@ def analyze_audio(path, duration, progress, cancel_event):
                 data = proc.stdout.read(hop * 2 * 200)   # 10 s of audio per read
                 if not data: break
                 data = data[:len(data) // 2 * 2]
-                samples = np.concatenate([carry, np.frombuffer(data, np.int16).astype(np.float32) / 32768.0])
+                fresh = np.frombuffer(data, np.int16).astype(np.float32) / 32768.0
+                if on_samples: on_samples(fresh)
+                samples = np.concatenate([carry, fresh])
                 usable = len(samples) // hop * hop
                 parts.append(np.sqrt(np.mean(samples[:usable].reshape(-1, hop) ** 2, axis=1)))
                 carry = samples[usable:]
@@ -386,6 +398,19 @@ def analyze_audio(path, duration, progress, cancel_event):
             err.seek(0); raise ScoutError("ffmpeg couldn't read the audio:\n\n" + error_tail(err.read()))
     rms = np.concatenate(parts) if parts else np.empty(0, np.float32)
     return np.maximum(20 * np.log10(np.maximum(rms, 1e-6)), DB_FLOOR)
+
+def read_audio_chunk(path, start, seconds):
+    """A stretch of the video's audio as 16 kHz mono float32 (for speech recognition)."""
+    cmd = [tool("ffmpeg"), "-hide_banner", "-nostdin", "-v", "error", "-ss", f"{start:.3f}", "-t", f"{seconds:.3f}",
+           "-i", path, "-vn", "-ac", "1", "-ar", str(hype.SAMPLE_RATE), "-f", "s16le", "-"]
+    proc = start_process(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    try: data, _ = proc.communicate()
+    finally: untrack_process(proc)
+    return np.frombuffer(data[:len(data) // 2 * 2], np.int16).astype(np.float32) / 32768.0
+
+def speech_cache_path(video_path):
+    session = session_file(video_path)
+    return os.path.join(SPEECH_DIR, os.path.basename(session)) if session else None
 
 
 # --- DETECTION ---
@@ -413,12 +438,10 @@ def detection_limit(base, mode, threshold_db, jump_db):
     if mode == "spike": return np.maximum(base + jump_db, threshold_db)
     return np.full_like(base, threshold_db)
 
-def find_highlights(smooth, base, mode, threshold_db, jump_db, pre_roll, post_roll, max_clips, duration):
-    """Picks the strongest moments first, skipping any whose clip would overlap one already picked."""
-    score = smooth - detection_limit(base, mode, threshold_db, jump_db)
+def pick_moments(score, pre_roll, post_roll, max_clips, duration):
+    """Picks the strongest moments (score > 0) first, skipping any whose clip would overlap one already picked."""
     score = np.where(score > 0, score, -np.inf)
     times = np.arange(len(score)) * HOP_SECONDS
-
     picked = []
     while len(picked) < max_clips:
         i = int(np.argmax(score))
@@ -430,8 +453,36 @@ def find_highlights(smooth, base, mode, threshold_db, jump_db, pre_roll, post_ro
         # Rule out every moment whose clip would overlap this one. A long loud stretch still yields several clips.
         score[(times > start - post_roll) & (times < end + pre_roll)] = -np.inf
     picked.sort(key=lambda c: c.start)
-    for n, clip in enumerate(picked, 1): clip.title = f"Clip_{n:02d}"
     return picked
+
+def name_untitled(clips):
+    for n, clip in enumerate(clips, 1):
+        if not clip.title: clip.title = f"Clip_{n:02d}"
+    return clips
+
+def find_highlights(smooth, base, mode, threshold_db, jump_db, pre_roll, post_roll, max_clips, duration):
+    score = smooth - detection_limit(base, mode, threshold_db, jump_db)
+    return name_untitled(pick_moments(score, pre_roll, post_roll, max_clips, duration))
+
+def find_hype_moments(smooth, base, hype_data, pre_roll, post_roll, max_clips, duration):
+    """Hype mode: combines loudness, reaction sounds, speech and chat, then tags each clip with why it was picked."""
+    signals = hype.build_signals(smooth, base, HOP_SECONDS, hype_data)
+    clips = pick_moments(signals.strength - HYPE_MIN_STRENGTH, pre_roll, post_roll, max_clips, duration)
+    for clip in clips:
+        if hype_data.speech: clip.start, clip.end = hype.snap_to_speech(clip.start, clip.end, hype_data.speech, duration)
+        clip.tags, title = hype.describe_moment(signals, hype_data, HOP_SECONDS, clip.peak, clip.start, clip.end)
+        clip.title = title or ""
+    # Snapping to sentences can make neighbours overlap; those are one moment, so join them.
+    merged = []
+    for clip in clips:
+        if merged and clip.start < merged[-1].end:
+            prev = merged[-1]
+            prev.end = max(prev.end, clip.end)
+            prev.tags = list(dict.fromkeys(prev.tags + clip.tags))[:5]
+            prev.title = prev.title or clip.title
+        else:
+            merged.append(clip)
+    return name_untitled(merged)
 
 
 # --- EXPORT ---
@@ -517,6 +568,7 @@ class HighlightScout:
         self.duration = 0.0
         self.smooth = None
         self.base = None
+        self.hype = hype.HypeData()          # reactions / speech / chat for the loaded video
         self.clips = []
         self.rows = []
         self.current_row = None
@@ -533,6 +585,7 @@ class HighlightScout:
         self._poll_queue()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(300, self._check_tools)
+        self.root.after(500, self._check_ai_parts)
 
     # --- THEME ---
     def _apply_theme(self, redraw=True):
@@ -551,6 +604,7 @@ class HighlightScout:
         s.configure("Status.TLabel", background=PANEL_BG, foreground=p["accent"], font=FONT_BOLD)
         s.configure("RowNum.TLabel", background=PANEL_BG, foreground=TEXT_MUTED, font=FONT)
         s.configure("RowNumCurrent.TLabel", background=PANEL_BG, foreground=p["accent"], font=FONT_BOLD)
+        s.configure("Tags.TLabel", background=PANEL_BG, foreground=p["accent_hover"], font=("Segoe UI", 8, "bold"))
 
         def button(name, bg, fg, border, hover_bg, hover_fg, hover_border, disabled_bg, disabled_fg, disabled_border):
             s.configure(name, background=bg, foreground=fg, bordercolor=border, lightcolor=bg, darkcolor=bg,
@@ -589,7 +643,7 @@ class HighlightScout:
         self._build_bottom_bar(bar)
 
     def _slider(self, parent, label, from_, to, value, fmt, on_change=None):
-        header = tb.Frame(parent); header.pack(fill=X, padx=10, pady=(8, 0))
+        header = tb.Frame(parent); header.pack(fill=X, padx=10, pady=(6, 0))
         tb.Label(header, text=label).pack(side=LEFT)
         value_label = tb.Label(header, text=fmt(value)); value_label.pack(side=RIGHT)
         var = tk.DoubleVar(value=value)
@@ -610,14 +664,28 @@ class HighlightScout:
         self.detect_hint = tb.Label(parent, text="", style="Muted.TLabel", wraplength=260, justify=LEFT)
         self.detect_hint.pack(anchor="w", padx=10)
 
-        self.threshold_var, _ = self._slider(parent, "dB_THRESHOLD", -60, 0, s["threshold_db"], lambda v: f"{v:.1f}dB", self._update_limit_line)
-        self.jump_var, self.jump_scale = self._slider(parent, "SPIKE_JUMP", 3, 30, s["jump_db"], lambda v: f"+{v:.1f}dB", self._update_limit_line)
+        # Loudness modes show the dB sliders; Hype mode shows its own options in the same spot.
+        mode_area = tb.Frame(parent); mode_area.pack(fill=X)
+        self.level_frame = tb.Frame(mode_area)
+        self.threshold_var, _ = self._slider(self.level_frame, "dB_THRESHOLD", -60, 0, s["threshold_db"], lambda v: f"{v:.1f}dB", self._update_limit_line)
+        self.jump_var, self.jump_scale = self._slider(self.level_frame, "SPIKE_JUMP", 3, 30, s["jump_db"], lambda v: f"+{v:.1f}dB", self._update_limit_line)
+
+        self.hype_frame = tb.Frame(mode_area)
+        self.speech_var = tk.BooleanVar(value=s["listen_speech"])
+        tb.Checkbutton(self.hype_frame, text="Listen to speech (slower, names clips)", variable=self.speech_var, bootstyle="primary",
+                       command=self._update_hype_status).pack(anchor="w", padx=10, pady=(6, 2))
+        self.hype_status = tb.Label(self.hype_frame, text="", style="Muted.TLabel", justify=LEFT, wraplength=260)
+        self.hype_status.pack(anchor="w", padx=10)
+        chat_row = tb.Frame(self.hype_frame); chat_row.pack(fill=X, padx=10, pady=(4, 0))
+        tb.Button(chat_row, text="LOAD CHAT REPLAY...", style="Bones.TButton", command=self.choose_chat_file).pack(side=LEFT, fill=X, expand=YES)
+        tb.Button(chat_row, text="CLEAR", style="BonesDanger.TButton", command=self.clear_chat).pack(side=LEFT, padx=(6, 0))
+
         self.pre_var, _ = self._slider(parent, "PRE_ROLL (before)", 0, 120, s["pre_roll"], lambda v: f"{int(v)}s")
         self.post_var, _ = self._slider(parent, "POST_ROLL (after)", 0, 120, s["post_roll"], lambda v: f"{int(v)}s")
         self.max_var, _ = self._slider(parent, "MAX_CLIPS", 1, 100, s["max_clips"], lambda v: f"{int(v)}")
 
         self.scan_btn = tb.Button(parent, text="SCAN", style="BonesAccent.TButton", command=self.scan)
-        self.scan_btn.pack(fill=X, padx=10, pady=(14, 10))
+        self.scan_btn.pack(fill=X, padx=10, pady=(10, 8))
         self._on_detect_mode_changed()
 
     def _build_review(self, parent):
@@ -767,14 +835,23 @@ class HighlightScout:
             duration, has_audio = probe_video(path)
             if not has_audio: raise ScoutError("This video has no audio track, so there's nothing to scan.")
             progress(0, "READING AUDIO...")
-            db = analyze_audio(path, duration, progress, self.cancel_event)
+            detector = hype.load_reaction_detector(resource_path("models"))   # listens for laughter etc. in the same pass
+            db = analyze_audio(path, duration, progress, self.cancel_event, detector.feed if detector else None)
             if len(db) == 0: raise ScoutError("No audio could be read from this file.")
             smooth = smooth_db(db)
-            return max(duration, len(db) * HOP_SECONDS), smooth, local_baseline(smooth)
+            data = hype.HypeData(reactions=detector.finish() if detector else None)
+            cache = speech_cache_path(path)
+            data.speech = hype.load_speech(cache) if cache else None
+            data.chat_path = hype.find_chat_file(path) or ""
+            if data.chat_path:
+                try: data.chat = hype.load_chat(data.chat_path)
+                except (OSError, ValueError): data.chat_path = ""
+            return max(duration, len(db) * HOP_SECONDS), smooth, local_baseline(smooth), data
 
         def done(result):
-            self.duration, self.smooth, self.base = result
+            self.duration, self.smooth, self.base, self.hype = result
             self.video_path = path
+            self._update_hype_status()
             stem = os.path.splitext(os.path.basename(path))[0]
             self.out_var.set(os.path.join(os.path.dirname(path), f"{stem}_clips"))
             self.file_label.configure(text=f"{os.path.basename(path)}  ({fmt_time(self.duration)})", foreground=TEXT)
@@ -789,23 +866,111 @@ class HighlightScout:
     def scan(self):
         if self.busy: return
         if self.smooth is None: self._show_warning("Load a video first!"); return
-        clips = find_highlights(self.smooth, self.base, DETECT_MODES[self.detect_var.get()],
-                                self.threshold_var.get(), self.jump_var.get(),
-                                round(self.pre_var.get()), round(self.post_var.get()),
-                                int(round(self.max_var.get())), self.duration)
+        mode = DETECT_MODES[self.detect_var.get()]
+        pre, post, max_clips = round(self.pre_var.get()), round(self.post_var.get()), int(round(self.max_var.get()))
+        if mode == "hype":
+            if self.speech_var.get() and self.hype.speech is None and hype.speech_available():
+                self._transcribe_then_scan(); return      # comes back here once speech is ready
+            clips = find_hype_moments(self.smooth, self.base, self.hype, pre, post, max_clips, self.duration)
+            hint = "No reactions found. Try a longer video, turn on speech, or load a chat replay."
+        else:
+            clips = find_highlights(self.smooth, self.base, mode, self.threshold_var.get(), self.jump_var.get(),
+                                    pre, post, max_clips, self.duration)
+            hint = "No clips found. Try lowering dB_THRESHOLD or SPIKE_JUMP.\nThe dashed line on the waveform shows what a moment has to beat."
         self._set_clips(clips)
         self._schedule_session_save()
         if clips:
             self.status_label.configure(text=f"FOUND {len(clips)} CLIPS")
         else:
             self.status_label.configure(text="NO CLIPS FOUND")
-            self._show_info("No clips found. Try lowering dB_THRESHOLD or SPIKE_JUMP.\nThe dashed line on the waveform shows what a moment has to beat.")
+            self._show_info(hint)
 
     def _on_detect_mode_changed(self):
         mode = DETECT_MODES[self.detect_var.get()]
         self.detect_hint.configure(text=DETECT_HINTS[mode])
         self.jump_scale.configure(state=NORMAL if mode == "spike" else DISABLED)
+        if mode == "hype":
+            self.level_frame.pack_forget(); self.hype_frame.pack(fill=X)
+        else:
+            self.hype_frame.pack_forget(); self.level_frame.pack(fill=X)
+        self._update_hype_status()
         self._update_limit_line()
+
+    # --- HYPE MODE ---
+    def _check_ai_parts(self):
+        """Loads the AI libraries once in the background, so the panel can say whether they work."""
+        def probe():
+            hype.reactions_available(resource_path("models")); hype.speech_available()
+            self.ui_queue.put(self._update_hype_status)
+        threading.Thread(target=probe, daemon=True).start()
+
+    def _update_hype_status(self):
+        if not hasattr(self, "hype_status"): return
+        if not hype.availability_checked():
+            self.hype_status.configure(text="Checking AI parts...\n\n"); return
+        h = self.hype
+        if not hype.reactions_available(resource_path("models")) or (self.smooth is not None and h.reactions is None):
+            reactions = "Reactions: unavailable (model or onnxruntime missing)"
+        elif self.smooth is None:
+            reactions = "Reactions: ready, listens when a video loads"
+        else:
+            reactions = "Reactions: ready"
+        if not hype.speech_available():
+            speech = "Speech: unavailable (faster-whisper not installed)"
+        elif not self.speech_var.get():
+            speech = "Speech: off"
+        elif h.speech is not None:
+            speech = f"Speech: ready ({len(h.speech)} lines)"
+        elif self.smooth is not None:
+            minutes = self.duration / 60 / 50   # measured: a 4.3 h stream took ~5 min on CPU (silence is skipped)
+            speech = f"Speech: runs on SCAN ({'under a minute' if minutes < 1 else f'about {round(minutes)} min'})"
+        else:
+            speech = "Speech: runs on SCAN"
+        chat = f"Chat: {os.path.basename(h.chat_path)} ({len(h.chat):,} messages)" if h.chat else "Chat: none (optional, Twitch / YouTube replay)"
+        self.hype_status.configure(text="\n".join((reactions, speech, chat)))
+
+    def _transcribe_then_scan(self):
+        path, duration = self.video_path, self.duration
+        first_time = not os.path.isdir(os.path.join(WHISPER_DIR, f"models--Systran--faster-whisper-{hype.WHISPER_MODEL}"))
+
+        def work(progress):
+            progress(0, "DOWNLOADING SPEECH MODEL (ONE TIME, ~145 MB)..." if first_time else "LOADING SPEECH MODEL...")
+            try: transcriber = hype.SpeechTranscriber(WHISPER_DIR)
+            except Exception as e:
+                log_error(traceback.format_exc())
+                raise ScoutError(f"Couldn't load the speech model{' (check your internet connection for the one-time download)' if first_time else ''}:\n\n{e}")
+            lines = transcriber.transcribe(lambda start, seconds: read_audio_chunk(path, start, seconds), duration,
+                                           lambda f: progress(f, f"LISTENING TO SPEECH {int(f * 100)}%"), self.cancel_event.is_set)
+            if lines is None: raise Cancelled()
+            cache = speech_cache_path(path)
+            if cache: hype.save_speech(cache, lines)
+            return lines
+
+        def done(lines):
+            if path != self.video_path: return
+            self.hype.speech = lines
+            self._update_hype_status()
+            self.scan()
+
+        self._run_in_background("PREPARING SPEECH...", work, done)
+
+    def choose_chat_file(self):
+        if not self.video_path: self._show_warning("Load a video first, then its chat replay."); return
+        path = filedialog.askopenfilename(title="Chat replay for this video", initialdir=os.path.dirname(self.video_path),
+                                          filetypes=[("Chat replay", "*.json"), ("All files", "*.*")])
+        if not path: return
+        try: chat = hype.load_chat(path)
+        except (OSError, ValueError) as e: self._show_error(f"Couldn't read that chat file:\n\n{e}"); return
+        if not chat:
+            self._show_warning("No chat messages found in that file.\n\nSupported: Twitch chat saved with TwitchDownloader (JSON) "
+                               "and YouTube live chat saved with yt-dlp (.live_chat.json)."); return
+        self.hype.chat, self.hype.chat_path = chat, path
+        self._update_hype_status()
+        self.status_label.configure(text=f"CHAT LOADED · {len(chat):,} MESSAGES")
+
+    def clear_chat(self):
+        self.hype.chat, self.hype.chat_path = None, ""
+        self._update_hype_status()
 
     # --- REVIEW ---
     def _set_clips(self, clips):
@@ -827,17 +992,20 @@ class HighlightScout:
         start_var = tk.StringVar(value=fmt_time(clip.start))
         end_var = tk.StringVar(value=fmt_time(clip.end))
 
-        tb.Checkbutton(frame, variable=sel_var, bootstyle="primary-round-toggle").pack(side=LEFT, padx=(4, 6))
-        num_label = tb.Label(frame, text=f"{number:02d}", width=3, style="RowNum.TLabel"); num_label.pack(side=LEFT)
-        tb.Entry(frame, textvariable=title_var, bootstyle="primary").pack(side=LEFT, fill=X, expand=YES, padx=(4, 8))
-        start_entry = tb.Entry(frame, textvariable=start_var, width=8, justify=CENTER, bootstyle="primary"); start_entry.pack(side=LEFT)
-        tb.Label(frame, text="–").pack(side=LEFT, padx=3)
-        end_entry = tb.Entry(frame, textvariable=end_var, width=8, justify=CENTER, bootstyle="primary"); end_entry.pack(side=LEFT)
-        length_label = tb.Label(frame, text="", width=6, foreground=TEXT_MUTED); length_label.pack(side=LEFT, padx=6)
+        frame.columnconfigure(2, weight=1)
+        tb.Checkbutton(frame, variable=sel_var, bootstyle="primary-round-toggle").grid(row=0, column=0, padx=(4, 6))
+        num_label = tb.Label(frame, text=f"{number:02d}", width=3, style="RowNum.TLabel"); num_label.grid(row=0, column=1)
+        tb.Entry(frame, textvariable=title_var, bootstyle="primary").grid(row=0, column=2, sticky="ew", padx=(4, 8))
+        start_entry = tb.Entry(frame, textvariable=start_var, width=8, justify=CENTER, bootstyle="primary"); start_entry.grid(row=0, column=3)
+        tb.Label(frame, text="–").grid(row=0, column=4, padx=3)
+        end_entry = tb.Entry(frame, textvariable=end_var, width=8, justify=CENTER, bootstyle="primary"); end_entry.grid(row=0, column=5)
+        length_label = tb.Label(frame, text="", width=6, foreground=TEXT_MUTED); length_label.grid(row=0, column=6, padx=6)
 
         row = ClipRow(clip, frame, sel_var, title_var, start_var, end_var, start_entry, end_entry, length_label, num_label)
-        tb.Button(frame, text="DELETE", style="BonesDanger.TButton", command=lambda: self._delete_row(row)).pack(side=RIGHT, padx=(4, 0))
-        tb.Button(frame, text="PREVIEW", style="Bones.TButton", command=lambda: self._preview_row(row)).pack(side=RIGHT, padx=(4, 0))
+        tb.Button(frame, text="PREVIEW", style="Bones.TButton", command=lambda: self._preview_row(row)).grid(row=0, column=7, padx=(4, 0))
+        tb.Button(frame, text="DELETE", style="BonesDanger.TButton", command=lambda: self._delete_row(row)).grid(row=0, column=8, padx=(4, 0))
+        if clip.tags:   # why Hype mode picked it
+            tb.Label(frame, text="  ·  ".join(clip.tags), style="Tags.TLabel").grid(row=1, column=2, columnspan=7, sticky="w", padx=(6, 0), pady=(0, 4))
 
         # Clicking or typing anywhere in a row makes it the one the keyboard shortcuts act on.
         for widget in (frame, *frame.winfo_children()):
@@ -997,8 +1165,10 @@ class HighlightScout:
 
     def _update_limit_line(self):
         if self.limit_line is None: return
-        limit = detection_limit(self.disp_base, DETECT_MODES[self.detect_var.get()], self.threshold_var.get(), self.jump_var.get())
-        self.limit_line.set_ydata(limit)
+        mode = DETECT_MODES[self.detect_var.get()]
+        self.limit_line.set_visible(mode != "hype")   # Hype mode isn't about a loudness line
+        if mode != "hype":
+            self.limit_line.set_ydata(detection_limit(self.disp_base, mode, self.threshold_var.get(), self.jump_var.get()))
         self.canvas.draw_idle()
 
     def _draw_clip_spans(self):
@@ -1151,6 +1321,7 @@ class HighlightScout:
             "post_roll": float(round(self.post_var.get())),
             "max_clips": int(round(self.max_var.get())),
             "export_mode": self.export_var.get(),
+            "listen_speech": self.speech_var.get(),
             "colorblind": self.colorblind_var.get(),
         })
         save_settings(self.settings)
