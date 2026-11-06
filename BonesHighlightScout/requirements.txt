@@ -4,6 +4,7 @@ ttkbootstrap>=1.10,<2
 numpy>=1.24
 matplotlib>=3.7
 tkinterdnd2>=0.4
+pillow>=10
 # Hype moments (AI): reaction sounds + speech. The app still runs without them.
 onnxruntime>=1.16
 faster-whisper>=1.0

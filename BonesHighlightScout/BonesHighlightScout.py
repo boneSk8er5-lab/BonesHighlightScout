@@ -7,6 +7,7 @@
 
 import ctypes
 import hashlib
+import io
 import json
 import os
 import platform
@@ -40,6 +41,7 @@ except ImportError:
     TkinterDnD = None
 
 import hype
+import vertical
 
 # --- DPI FIX / TASKBAR ICON ---
 if platform.system() == "Windows":
@@ -109,6 +111,9 @@ CAPTION_STUDIO_URL = None   # TODO: download page for Bones' Caption Studio. Unt
 CAPTION_STUDIO_PITCH = "Try Bones' Caption Studio!"
 
 NO_WINDOW = subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0
+LOW_PRIORITY = subprocess.BELOW_NORMAL_PRIORITY_CLASS if platform.system() == "Windows" else 0
+NORMAL_PRIORITY = subprocess.NORMAL_PRIORITY_CLASS if platform.system() == "Windows" else 0
+WORK_THREADS = max(2, (os.cpu_count() or 4) - 4)   # renders and the sound model leave a few CPU threads free
 
 VIDEO_TYPES = [("Video files", "*.mp4 *.mkv *.mov *.avi *.webm *.flv *.m4v *.ts"), ("All files", "*.*")]
 DETECT_MODES = {
@@ -126,6 +131,7 @@ EXPORT_MODES = {
     "Fast (copy, may start early)": "copy",
     "Vertical 9:16 (blur fill)": "vertical_blur",
     "Vertical 9:16 (center crop)": "vertical_crop",
+    "Vertical short (cam + game)": "short",
 }
 DEFAULT_SETTINGS = {
     "detect_mode": "Hype moments (AI)",
@@ -139,6 +145,7 @@ DEFAULT_SETTINGS = {
     "last_dir": "",
     "colorblind": False,
     "caption_studio_path": "",
+    "short_layout": {},
 }
 
 
@@ -338,11 +345,22 @@ def save_settings(settings):
 _active_procs = set()
 _procs_lock = threading.Lock()
 
-def start_process(cmd, **kwargs):
-    try: proc = subprocess.Popen(cmd, creationflags=NO_WINDOW, **kwargs)
+def start_process(cmd, low_priority=True, **kwargs):
+    """Heavy jobs run below normal priority so the rest of the PC stays responsive. Previews stay at normal so they play smoothly."""
+    try: proc = subprocess.Popen(cmd, creationflags=NO_WINDOW | (LOW_PRIORITY if low_priority else NORMAL_PRIORITY), **kwargs)
     except FileNotFoundError: raise ScoutError(f"{os.path.basename(cmd[0])} wasn't found. Install ffmpeg and make sure it's on PATH.")
     with _procs_lock: _active_procs.add(proc)
     return proc
+
+def set_own_priority(low):
+    """The AI models run inside this process, so it drops to low priority while a job is running."""
+    if platform.system() != "Windows": return
+    try:
+        kernel32 = ctypes.windll.kernel32
+        kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+        kernel32.SetPriorityClass.argtypes = (ctypes.c_void_p, ctypes.c_uint32)
+        kernel32.SetPriorityClass(kernel32.GetCurrentProcess(), LOW_PRIORITY if low else NORMAL_PRIORITY)
+    except Exception: pass
 
 def untrack_process(proc):
     with _procs_lock: _active_procs.discard(proc)
@@ -351,6 +369,26 @@ def kill_all_processes():
     with _procs_lock:
         for proc in list(_active_procs):
             if proc.poll() is None: proc.kill()
+
+def probe_video_size(path):
+    """(width, height) of the video, or (16, 9) if it can't be read: only the shape matters."""
+    cmd = [tool("ffprobe"), "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "json", path]
+    try:
+        stream = json.loads(subprocess.run(cmd, capture_output=True, creationflags=NO_WINDOW).stdout)["streams"][0]
+        return int(stream["width"]), int(stream["height"])
+    except (OSError, ValueError, KeyError, IndexError):
+        return 16, 9
+
+def grab_frame(path, seconds):
+    """One frame of the video as a PIL image (for the vertical layout editor)."""
+    cmd = [tool("ffmpeg"), "-hide_banner", "-nostdin", "-v", "error", "-ss", f"{seconds:.3f}", "-i", path, "-frames:v", "1",
+           "-vf", "scale='min(1920,iw)':-2", "-f", "image2pipe", "-c:v", "png", "-"]
+    proc = start_process(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    try: data, _ = proc.communicate()
+    finally: untrack_process(proc)
+    image = vertical.Image.open(io.BytesIO(data))
+    image.load()
+    return image
 
 def probe_video(path):
     """Returns (duration_seconds, has_audio)."""
@@ -486,12 +524,14 @@ def find_hype_moments(smooth, base, hype_data, pre_roll, post_roll, max_clips, d
 
 
 # --- EXPORT ---
-def build_export_cmd(src, clip, out, mode):
+def build_export_cmd(src, clip, out, mode, short_graph=None):
     cmd = [tool("ffmpeg"), "-hide_banner", "-nostdin", "-y", "-ss", f"{clip.start:.3f}", "-i", src, "-t", f"{clip.end - clip.start:.3f}"]
     if mode == "copy":
         cmd += ["-map", "0:v:0?", "-map", "0:a:0?", "-c", "copy", "-avoid_negative_ts", "make_zero"]
     else:
-        if mode == "vertical_blur":
+        if mode == "short":
+            cmd += ["-filter_complex", short_graph, "-map", "[v]", "-map", "0:a:0?"]
+        elif mode == "vertical_blur":
             graph = ("[0:v]split=2[bg0][fg0];"
                      "[bg0]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=20:2[bg];"
                      "[fg0]scale=1080:-2[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2[v]")
@@ -500,7 +540,9 @@ def build_export_cmd(src, clip, out, mode):
             cmd += ["-vf", "crop=ih*9/16:ih,scale=1080:1920", "-map", "0:v:0", "-map", "0:a:0?"]
         else:
             cmd += ["-map", "0:v:0", "-map", "0:a:0?"]
-        cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
+        threads = str(WORK_THREADS)
+        cmd += ["-filter_threads", threads, "-filter_complex_threads", threads, "-threads", threads,
+                "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
                 "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart"]
     return cmd + ["-progress", "pipe:1", "-nostats", out]
 
@@ -573,6 +615,7 @@ class HighlightScout:
         self.rows = []
         self.current_row = None
         self.last_export_dir = ""
+        self.video_size = (16, 9)
         self._save_job = None
         self.span_artists = []
         self.limit_line = None
@@ -715,6 +758,10 @@ class HighlightScout:
         self.render_btn = tb.Button(footer, text="RENDER SELECTED", style="BonesAccent.TButton", command=self.render)
         self.render_btn.grid(row=0, column=5)
         tb.Button(footer, text="CAPTION STUDIO", style="Bones.TButton", command=self.open_caption_studio).grid(row=0, column=6, padx=(6, 0))
+        self.short_label = tb.Label(footer, text="", style="Muted.TLabel")
+        self.short_label.grid(row=1, column=0, columnspan=5, sticky="w", pady=(6, 0))
+        tb.Button(footer, text="VERTICAL SHORT LAYOUT...", style="Bones.TButton", command=self.open_short_editor).grid(row=1, column=5, columnspan=2, sticky="ew", pady=(6, 0))
+        self._update_short_label()
 
     def _build_waveform(self, parent):
         self.fig = Figure(figsize=(10, 2.1), dpi=100, facecolor=PANEL_BG)
@@ -772,6 +819,7 @@ class HighlightScout:
 
     def _set_busy(self, busy, status=None):
         self.busy = busy
+        set_own_priority(low=busy)
         state = DISABLED if busy else NORMAL
         for btn in (self.load_btn, self.scan_btn, self.render_btn): btn.configure(state=state)
         self.cancel_btn.configure(state=NORMAL if busy else DISABLED)
@@ -833,9 +881,10 @@ class HighlightScout:
 
         def work(progress):
             duration, has_audio = probe_video(path)
+            size = probe_video_size(path)
             if not has_audio: raise ScoutError("This video has no audio track, so there's nothing to scan.")
             progress(0, "READING AUDIO...")
-            detector = hype.load_reaction_detector(resource_path("models"))   # listens for laughter etc. in the same pass
+            detector = hype.load_reaction_detector(resource_path("models"), WORK_THREADS)   # listens for laughter etc. in the same pass
             db = analyze_audio(path, duration, progress, self.cancel_event, detector.feed if detector else None)
             if len(db) == 0: raise ScoutError("No audio could be read from this file.")
             smooth = smooth_db(db)
@@ -846,10 +895,10 @@ class HighlightScout:
             if data.chat_path:
                 try: data.chat = hype.load_chat(data.chat_path)
                 except (OSError, ValueError): data.chat_path = ""
-            return max(duration, len(db) * HOP_SECONDS), smooth, local_baseline(smooth), data
+            return max(duration, len(db) * HOP_SECONDS), smooth, local_baseline(smooth), data, size
 
         def done(result):
-            self.duration, self.smooth, self.base, self.hype = result
+            self.duration, self.smooth, self.base, self.hype, self.video_size = result
             self.video_path = path
             self._update_hype_status()
             stem = os.path.splitext(os.path.basename(path))[0]
@@ -1091,19 +1140,25 @@ class HighlightScout:
     # --- KEYBOARD SHORTCUTS ---
     def _bind_shortcuts(self):
         r = self.root
-        r.bind_all("<Control-o>", lambda e: self.load_video())
-        r.bind_all("<Control-O>", lambda e: self.load_video())
-        r.bind_all("<F5>", lambda e: self.scan())
-        r.bind_all("<Control-r>", lambda e: self.render())
-        r.bind_all("<Control-R>", lambda e: self.render())
-        r.bind_all("<Escape>", self._on_escape)
+        r.bind_all("<Control-o>", lambda e: self._in_main_window(e) and self.load_video())
+        r.bind_all("<Control-O>", lambda e: self._in_main_window(e) and self.load_video())
+        r.bind_all("<F5>", lambda e: self._in_main_window(e) and self.scan())
+        r.bind_all("<Control-r>", lambda e: self._in_main_window(e) and self.render())
+        r.bind_all("<Control-R>", lambda e: self._in_main_window(e) and self.render())
+        r.bind_all("<Escape>", lambda e: self._in_main_window(e) and self._on_escape(e))
         r.bind_all("<space>", lambda e: self._row_key(e, lambda row: self._preview_row(row)))
         r.bind_all("<Delete>", lambda e: self._row_key(e, self._delete_row))
         r.bind_all("<Up>", lambda e: self._row_key(e, lambda row: self._move_current(-1)))
         r.bind_all("<Down>", lambda e: self._row_key(e, lambda row: self._move_current(1)))
 
+    def _in_main_window(self, event):
+        """Shortcuts belong to the main window, not to pop-ups like the layout editor (Delete mustn't remove a clip there)."""
+        try: return event.widget.winfo_toplevel() is self.root
+        except AttributeError: return False
+
     def _row_key(self, event, action):
         """Row shortcuts stay out of the way while typing in a box or using a dropdown/button."""
+        if not self._in_main_window(event): return
         if event.widget.winfo_class() in ("TEntry", "Entry", "TCombobox", "TSpinbox", "Text", "TButton", "TCheckbutton", "Listbox"): return
         if self.busy or not self.rows: return
         if self.current_row not in self.rows: self._set_current_row(self.rows[0])
@@ -1196,7 +1251,7 @@ class HighlightScout:
         cmd = [tool("ffplay"), "-hide_banner", "-loglevel", "error", "-autoexit", "-x", "960", "-y", "540",
                "-window_title", f"Preview {fmt_time(start)} - {fmt_time(end)}",
                "-ss", f"{start:.2f}", "-t", f"{end - start:.2f}", self.video_path]
-        try: self.preview_proc = start_process(cmd)
+        try: self.preview_proc = start_process(cmd, low_priority=False)
         except ScoutError as e: self._show_error(str(e))
 
     def _stop_preview(self):
@@ -1220,6 +1275,12 @@ class HighlightScout:
         if not out_dir: self._show_warning("Choose a folder to export to."); return
 
         mode = EXPORT_MODES[self.export_var.get()]
+        short_graph = None
+        if mode == "short":
+            layout = vertical.validate_layout(self.settings["short_layout"])
+            if layout is None:   # first time: set the boxes, then carry on rendering
+                self.open_short_editor(then_render=True); return
+            short_graph = vertical.short_filtergraph(layout, self.video_size[0] / self.video_size[1])
         ext = os.path.splitext(self.video_path)[1] if mode == "copy" else ".mp4"
         try: os.makedirs(out_dir, exist_ok=True)
         except OSError as e: self._show_error(f"Couldn't create the export folder:\n{e}"); return
@@ -1232,7 +1293,7 @@ class HighlightScout:
             for i, (clip, out) in enumerate(jobs):
                 name = os.path.basename(out)
                 progress(i / len(jobs), f"RENDERING {i + 1}/{len(jobs)}: {name}")
-                error = run_export(build_export_cmd(src, clip, out, mode), out, clip.end - clip.start,
+                error = run_export(build_export_cmd(src, clip, out, mode, short_graph), out, clip.end - clip.start,
                                    lambda f: progress((i + f) / len(jobs)), self.cancel_event)
                 if error: failures.append(f"{name}:\n{error}")
                 else: exported.append(out)
@@ -1254,6 +1315,31 @@ class HighlightScout:
 
         self._run_in_background("RENDERING...", work, done)
 
+    # --- VERTICAL SHORT ---
+    def _update_short_label(self):
+        saved = vertical.validate_layout(self.settings["short_layout"])
+        self.short_label.configure(text="Vertical short: webcam + gameplay layout saved" if saved
+                                   else "Vertical short: place the webcam and gameplay boxes, then export with \"Vertical short\"")
+
+    def open_short_editor(self, then_render=False):
+        if self.busy: return
+        if not self.video_path: self._show_warning("Load a video first, so the layout can be set on a real frame."); return
+        aspect = self.video_size[0] / self.video_size[1]
+        layout = vertical.validate_layout(self.settings["short_layout"]) or vertical.default_layout(aspect)
+        row = self.current_row if self.current_row in self.rows else None
+        start = row.clip.peak if row else self.duration / 2
+        path = self.video_path
+
+        def saved(new_layout):
+            self.settings["short_layout"] = new_layout
+            self._update_short_label()
+            self.export_var.set(next(k for k, v in EXPORT_MODES.items() if v == "short"))
+            self.status_label.configure(text="VERTICAL LAYOUT SAVED")
+            if then_render: self.render()
+
+        vertical.ShortLayoutEditor(self.root, layout, aspect, self.duration, start, lambda t: grab_frame(path, t),
+                                   self.ui_queue.put, self.palette, saved)
+
     # --- BONES' CAPTION STUDIO ---
     def open_caption_studio(self, clip_path=None):
         """Starts Caption Studio if it's installed, and opens the clips folder beside it so a clip can be dragged in.
@@ -1264,7 +1350,7 @@ class HighlightScout:
         if exe is None: self._offer_caption_studio(); return
 
         # Caption Studio ignores the extra argument today; it's passed so a future version can open the clip directly.
-        try: subprocess.Popen([exe] + ([clip_path] if clip_path else []), cwd=os.path.dirname(exe))
+        try: subprocess.Popen([exe] + ([clip_path] if clip_path else []), cwd=os.path.dirname(exe), creationflags=NORMAL_PRIORITY)
         except OSError as e: self._show_error(f"Couldn't start {CAPTION_STUDIO_NAME}:\n\n{e}"); return
         self.settings["caption_studio_path"] = exe
         folder = self.last_export_dir or self.out_var.get().strip()

@@ -23,6 +23,7 @@
   <ItemGroup>
     <Compile Include="BonesHighlightScout.py" />
     <Compile Include="hype.py" />
+    <Compile Include="vertical.py" />
   </ItemGroup>
   <ItemGroup>
     <Content Include="requirements.txt" />

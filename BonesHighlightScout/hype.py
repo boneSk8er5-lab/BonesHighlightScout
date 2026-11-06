@@ -37,9 +37,12 @@ REACTION_TAG_MIN = 0.25      # how sure YAMNet must be before a clip gets that t
 class ReactionDetector:
     """Feed it 16 kHz audio in any size pieces; it runs YAMNet every 10 minutes of audio."""
 
-    def __init__(self, model_path):
+    def __init__(self, model_path, threads=0):
         import onnxruntime as ort
-        self.session = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+        options = ort.SessionOptions()
+        options.intra_op_num_threads = min(threads, 8)   # more than 8 gains nothing on a model this small (0 = onnxruntime's default)
+        options.add_session_config_entry("session.intra_op.allow_spinning", "0")   # idle threads sleep instead of burning CPU
+        self.session = ort.InferenceSession(model_path, options, providers=["CPUExecutionProvider"])
         self.buffer = np.empty(0, np.float32)
         self.frames = []
         chunk = int(YAMNET_CHUNK_FRAMES * YAMNET_HOP * SAMPLE_RATE)
@@ -66,11 +69,11 @@ class ReactionDetector:
         return out.astype(np.float32)
 
 
-def load_reaction_detector(model_dir):
+def load_reaction_detector(model_dir, threads=0):
     """None if onnxruntime or the model file is missing; the rest of the app keeps working."""
     path = os.path.join(model_dir, "yamnet.onnx")
     if not os.path.isfile(path): return None
-    try: return ReactionDetector(path)
+    try: return ReactionDetector(path, threads)
     except Exception: return None
 
 
