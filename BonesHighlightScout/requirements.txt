@@ -1,5 +1,5 @@
 # Bones Highlight Scout
-# Also needs ffmpeg, ffprobe and ffplay on PATH (https://ffmpeg.org/download.html)
+# Also needs ffmpeg on PATH (https://ffmpeg.org/download.html)
 ttkbootstrap>=1.10,<2
 numpy>=1.24
 matplotlib>=3.7

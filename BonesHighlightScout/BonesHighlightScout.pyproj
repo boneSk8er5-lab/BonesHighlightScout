@@ -25,6 +25,7 @@
     <Compile Include="hype.py" />
     <Compile Include="vertical.py" />
     <Compile Include="player.py" />
+    <Compile Include="selftest.py" />
   </ItemGroup>
   <ItemGroup>
     <Content Include="requirements.txt" />

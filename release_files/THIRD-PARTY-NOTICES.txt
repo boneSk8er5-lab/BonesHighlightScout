@@ -1,0 +1,45 @@
+THIRD-PARTY SOFTWARE IN BONES HIGHLIGHT SCOUT
+=============================================
+This app includes the open-source software below. Each stays under its own license.
+
+
+FFmpeg (ffmpeg\ffmpeg.exe)
+--------------------------
+FFMPEG_VERSION_LINE
+Licensed under the GNU General Public License, version 3 or later:
+https://www.gnu.org/licenses/gpl-3.0.html
+This is a separate program that the app runs. Build by gyan.dev: https://www.gyan.dev/ffmpeg/builds/
+Source code: https://ffmpeg.org/download.html and https://git.ffmpeg.org/ffmpeg.git
+(this build is commit FFMPEG_COMMIT).
+Written requests for the matching source code can go to the person who sent you this app.
+
+
+AI models
+---------
+YAMNet, converted to ONNX (sound recognition) - Apache License 2.0
+  https://huggingface.co/audiomagic/yamnet-onnx
+  Class labels from the AudioSet ontology - CC BY 4.0
+  The license text is in _internal\models\yamnet_LICENSE.txt
+Whisper "base", converted by Systran (speech recognition) - MIT License
+  https://huggingface.co/Systran/faster-whisper-base
+Silero VAD (voice detection, included with faster-whisper) - MIT License
+  https://github.com/snakers4/silero-vad
+
+
+Libraries
+---------
+PyAV (video decoding), which includes FFmpeg libraries - BSD 3-Clause; its FFmpeg
+  libraries are under their own licenses (LGPL/GPL): https://github.com/PyAV-Org/PyAV
+faster-whisper - MIT: https://github.com/SYSTRAN/faster-whisper
+CTranslate2 - MIT: https://github.com/OpenNMT/CTranslate2
+ONNX Runtime - MIT: https://github.com/microsoft/onnxruntime
+NumPy - BSD 3-Clause: https://numpy.org
+Matplotlib - Matplotlib License (BSD-style): https://matplotlib.org
+Pillow - MIT-CMU: https://python-pillow.org
+ttkbootstrap - MIT: https://github.com/israel-dryer/ttkbootstrap
+tkinterdnd2 / tkdnd - MIT: https://github.com/Eliav2/tkinterdnd2
+Tcl/Tk - Tcl/Tk License (BSD-style): https://www.tcl.tk
+Python - PSF License: https://www.python.org
+PyInstaller bootloader - GPL with an exception that allows this use: https://pyinstaller.org
+Microsoft Visual C++ Runtime - Microsoft redistributable license
+Intel OpenMP runtime (libiomp5) - included with CTranslate2 under its Intel license

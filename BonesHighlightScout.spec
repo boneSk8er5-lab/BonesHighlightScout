@@ -10,7 +10,7 @@ datas += [(f"{app}/models/yamnet.onnx", "models"), (f"{app}/models/yamnet_class_
           (f"{app}/models/yamnet_LICENSE.txt", "models")]   # reaction-sound model (Hype mode)
 datas += collect_data_files("ttkbootstrap")
 datas += collect_data_files("tkinterdnd2")   # the tkdnd library that drag-and-drop loads at runtime
-hiddenimports = ["tkinterdnd2", "hype"]
+hiddenimports = ["tkinterdnd2", "hype", "selftest"]
 # Hype mode: onnxruntime runs the sound model; faster-whisper + ctranslate2 do speech. Only their DLLs and
 # data files are collected; collecting every submodule drags in optional converters that import PyTorch.
 binaries = collect_dynamic_libs("ctranslate2") + collect_dynamic_libs("onnxruntime")

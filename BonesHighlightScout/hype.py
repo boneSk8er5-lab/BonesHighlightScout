@@ -125,12 +125,13 @@ class SpeechLine:
 
 
 class SpeechTranscriber:
-    """Wraps faster-whisper. The model (~145 MB) downloads into model_dir the first time."""
+    """Wraps faster-whisper. Uses the model at bundled_model if a release ships one; otherwise it (~145 MB)
+    downloads into model_dir the first time."""
 
-    def __init__(self, model_dir):
+    def __init__(self, model_dir, bundled_model=None):
         os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
         from faster_whisper import WhisperModel
-        self.model = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8", download_root=model_dir)
+        self.model = WhisperModel(bundled_model or WHISPER_MODEL, device="cpu", compute_type="int8", download_root=model_dir)
         self.language = None
 
     def transcribe(self, read_chunk, duration, progress, cancelled):

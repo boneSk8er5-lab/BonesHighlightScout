@@ -2,8 +2,8 @@
 rem Builds dist\BonesHighlightScout\BonesHighlightScout.exe
 rem
 rem   build_exe.bat                 the app uses ffmpeg from PATH (small build)
-rem   build_exe.bat --with-ffmpeg   also copies ffmpeg, ffprobe and ffplay into the build so it runs
-rem                                 on PCs without ffmpeg (adds about 650 MB with a "full" ffmpeg build)
+rem   build_exe.bat --with-ffmpeg   also copies ffmpeg into the build so it runs on PCs without it
+rem                                 (for a build to share, use tools\make_release.py instead)
 cd /d "%~dp0"
 
 rem Windows won't let a running program be replaced.
@@ -24,7 +24,7 @@ if errorlevel 1 goto :fail
 
 if /i "%~1"=="--with-ffmpeg" (
     if not exist "dist\BonesHighlightScout\ffmpeg" mkdir "dist\BonesHighlightScout\ffmpeg"
-    for %%t in (ffmpeg ffprobe ffplay) do (
+    for %%t in (ffmpeg) do (
         for /f "delims=" %%p in ('where %%t 2^>nul') do copy /y "%%p" "dist\BonesHighlightScout\ffmpeg\" >nul
     )
     echo Copied ffmpeg into the build.

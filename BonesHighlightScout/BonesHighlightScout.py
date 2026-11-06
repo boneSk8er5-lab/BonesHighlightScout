@@ -1,9 +1,9 @@
 # ==============================================================================
-# BONES HIGHLIGHT SCOUT v3.0.0
+# BONES HIGHLIGHT SCOUT
 # ==============================================================================
 # Finds the loud / hype moments in a video from its audio, lets you review and
 # trim them, then exports the keepers with ffmpeg.
-# Needs ffmpeg and ffprobe on PATH. Python packages: requirements.txt
+# Needs ffmpeg, either on PATH or in an ffmpeg folder beside the app. Python packages: requirements.txt
 
 import ctypes
 import hashlib
@@ -52,7 +52,7 @@ if platform.system() == "Windows":
     except Exception: pass
 
 # --- CONSTANTS ---
-APP_VERSION = "3.0.0"
+APP_VERSION = "3.1.0-beta.1"
 ANALYSIS_RATE = hype.SAMPLE_RATE   # 16 kHz: what the reaction model needs; loudness comes from the same pass
 HOP_SECONDS = 0.05          # one loudness reading every 50 ms
 HYPE_MIN_STRENGTH = 0.5     # how much has to be going on before a moment counts in Hype mode
@@ -97,7 +97,21 @@ def theme_colors(colorblind):
             "bg": PANEL_BG, "fg": TEXT, "selectbg": BUTTON_BG, "selectfg": TEXT,
             "border": PANEL_BORDER, "inputfg": TEXT, "inputbg": INPUT_BG, "active": BUTTON_BORDER}
 
-APP_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "BonesHighlightScout")
+def _find_data_folder():
+    """A portable copy (portable.txt beside the .exe) keeps everything in a data folder beside it, so it can
+    live on a USB drive and leaves nothing on the PC. Otherwise, or if that folder can't be written, AppData."""
+    if getattr(sys, "frozen", False):
+        beside = os.path.dirname(sys.executable)
+        if os.path.isfile(os.path.join(beside, "portable.txt")):
+            folder = os.path.join(beside, "data")
+            try:
+                os.makedirs(folder, exist_ok=True)
+                with tempfile.TemporaryFile(dir=folder): pass
+                return folder
+            except OSError: pass
+    return os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "BonesHighlightScout")
+
+APP_DIR = _find_data_folder()
 SETTINGS_PATH = os.path.join(APP_DIR, "settings.json")
 ERROR_LOG_PATH = os.path.join(APP_DIR, "error.log")
 SESSIONS_DIR = os.path.join(APP_DIR, "sessions")
@@ -229,7 +243,7 @@ def tool(name):
     return find_tool(name) or name
 
 def missing_tools():
-    return [t for t in ("ffmpeg", "ffprobe") if find_tool(t) is None]   # ffplay is only a fallback for the built-in player
+    return [t for t in ("ffmpeg",) if find_tool(t) is None]   # ffplay is only a fallback for the built-in player
 
 # --- CLIP MEMORY ---
 # Clips are saved per video (keyed by path, size and modified time) so reopening a video brings them back.
@@ -385,27 +399,18 @@ def kill_all_processes():
         for proc in list(_active_procs):
             if proc.poll() is None: proc.kill()
 
-def probe_video_size(path):
-    """(width, height) of the video, or (16, 9) if it can't be read: only the shape matters."""
-    cmd = [tool("ffprobe"), "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height", "-of", "json", path]
-    try:
-        stream = json.loads(subprocess.run(cmd, capture_output=True, creationflags=NO_WINDOW).stdout)["streams"][0]
-        return int(stream["width"]), int(stream["height"])
-    except (OSError, ValueError, KeyError, IndexError):
-        return 16, 9
-
 def probe_video(path):
-    """Returns (duration_seconds, has_audio)."""
-    cmd = [tool("ffprobe"), "-v", "error", "-show_entries", "format=duration:stream=codec_type", "-of", "json", path]
-    try: result = subprocess.run(cmd, capture_output=True, creationflags=NO_WINDOW)
-    except FileNotFoundError: raise ScoutError("ffprobe wasn't found. Install ffmpeg and make sure it's on PATH.")
-    if result.returncode != 0: raise ScoutError("Couldn't read this file. Is it a video?\n\n" + error_tail(result.stderr))
-    try: info = json.loads(result.stdout or b"{}")
-    except ValueError: info = {}
-    try: duration = float(info.get("format", {}).get("duration") or 0)
-    except ValueError: duration = 0.0
-    has_audio = any(s.get("codec_type") == "audio" for s in info.get("streams", []))
-    return duration, has_audio
+    """Returns (duration_seconds, has_audio, (width, height))."""
+    import av
+    try:
+        with av.open(path) as container:
+            if not container.streams.video: raise ScoutError("This file has no video in it, so it can't be clipped.")
+            video = container.streams.video[0]
+            duration = (container.duration or 0) / av.time_base
+            return duration, bool(container.streams.audio), (video.width or 16, video.height or 9)
+    except ScoutError: raise
+    except Exception as e:
+        raise ScoutError(f"Couldn't read this file. Is it a video?\n\n{e}")
 
 def analyze_audio(path, duration, progress, cancel_event, on_samples=None):
     """Streams the audio out of ffmpeg and returns its loudness in dB, one value per HOP_SECONDS.
@@ -889,8 +894,7 @@ class HighlightScout:
         self._save_session_now()   # keep the current video's clips before switching
 
         def work(progress):
-            duration, has_audio = probe_video(path)
-            size = probe_video_size(path)
+            duration, has_audio, size = probe_video(path)
             if not has_audio: raise ScoutError("This video has no audio track, so there's nothing to scan.")
             progress(0, "READING AUDIO...")
             detector = hype.load_reaction_detector(resource_path("models"), WORK_THREADS)   # listens for laughter etc. in the same pass
@@ -989,11 +993,13 @@ class HighlightScout:
 
     def _transcribe_then_scan(self):
         path, duration = self.video_path, self.duration
-        first_time = not os.path.isdir(os.path.join(WHISPER_DIR, f"models--Systran--faster-whisper-{hype.WHISPER_MODEL}"))
+        bundled = resource_path(os.path.join("models", f"whisper-{hype.WHISPER_MODEL}"))   # a release build ships the model
+        bundled = bundled if os.path.isdir(bundled) else None
+        first_time = not bundled and not os.path.isdir(os.path.join(WHISPER_DIR, f"models--Systran--faster-whisper-{hype.WHISPER_MODEL}"))
 
         def work(progress):
             progress(0, "DOWNLOADING SPEECH MODEL (ONE TIME, ~145 MB)..." if first_time else "LOADING SPEECH MODEL...")
-            try: transcriber = hype.SpeechTranscriber(WHISPER_DIR)
+            try: transcriber = hype.SpeechTranscriber(WHISPER_DIR, bundled)
             except Exception as e:
                 log_error(traceback.format_exc())
                 raise ScoutError(f"Couldn't load the speech model{' (check your internet connection for the one-time download)' if first_time else ''}:\n\n{e}")
@@ -1277,6 +1283,8 @@ class HighlightScout:
             self._preview_with_ffplay(start, end)
 
     def _preview_with_ffplay(self, start, end):
+        if find_tool("ffplay") is None:
+            self._show_error(f"Couldn't play this video in the preview.\n\nDetails: {ERROR_LOG_PATH}"); return
         cmd = [tool("ffplay"), "-hide_banner", "-loglevel", "error", "-autoexit", "-x", "960", "-y", "540",
                "-window_title", f"Preview {fmt_time(start)} - {fmt_time(end)}",
                "-ss", f"{start:.2f}", "-t", f"{end - start:.2f}", self.video_path]
@@ -1483,4 +1491,8 @@ class HighlightScout:
 
 
 if __name__ == "__main__":
-    HighlightScout().run()
+    if "--self-test" in sys.argv:    # checks a build works from start to finish: --self-test video.mp4 result.json
+        import selftest
+        selftest.run(sys.modules[__name__], *sys.argv[sys.argv.index("--self-test") + 1:][:2])
+    else:
+        HighlightScout().run()
