@@ -7,7 +7,6 @@
 
 import ctypes
 import hashlib
-import io
 import json
 import os
 import platform
@@ -168,6 +167,7 @@ class Clip:
     title: str = ""
     selected: bool = True
     tags: list = field(default_factory=list)   # why it was picked, e.g. LAUGHTER, "NO WAY", CHAT x6
+    layout: dict = None                        # its own vertical short layout; None follows the shared one
 
 
 # --- HELPERS ---
@@ -257,7 +257,8 @@ def load_session(video_path, duration):
     try:
         with open(path, encoding="utf-8") as f: saved = json.load(f)["clips"]
         clips = [Clip(start=float(c["start"]), end=float(c["end"]), peak=float(c["peak"]), score=float(c["score"]),
-                      title=str(c["title"]), selected=bool(c["selected"]), tags=[str(t) for t in c.get("tags", [])]) for c in saved]
+                      title=str(c["title"]), selected=bool(c["selected"]), tags=[str(t) for t in c.get("tags", [])],
+                      layout=vertical.validate_layout(c.get("layout"))) for c in saved]
     except (OSError, TypeError, ValueError, KeyError): return []
     return [c for c in clips if 0 <= c.start < c.end <= duration + 0.5]
 
@@ -392,17 +393,6 @@ def probe_video_size(path):
         return int(stream["width"]), int(stream["height"])
     except (OSError, ValueError, KeyError, IndexError):
         return 16, 9
-
-def grab_frame(path, seconds):
-    """One frame of the video as a PIL image (for the vertical layout editor)."""
-    cmd = [tool("ffmpeg"), "-hide_banner", "-nostdin", "-v", "error", "-ss", f"{seconds:.3f}", "-i", path, "-frames:v", "1",
-           "-vf", "scale='min(1920,iw)':-2", "-f", "image2pipe", "-c:v", "png", "-"]
-    proc = start_process(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-    try: data, _ = proc.communicate()
-    finally: untrack_process(proc)
-    image = vertical.Image.open(io.BytesIO(data))
-    image.load()
-    return image
 
 def probe_video(path):
     """Returns (duration_seconds, has_audio)."""
@@ -1329,12 +1319,15 @@ class HighlightScout:
         if not out_dir: self._show_warning("Choose a folder to export to."); return
 
         mode = EXPORT_MODES[self.export_var.get()]
-        short_graph = None
+        short_graphs = {}    # each clip can have its own layout
         if mode == "short":
-            layout = vertical.validate_layout(self.settings["short_layout"])
-            if layout is None:   # first time: set the boxes, then carry on rendering
-                self.open_short_editor(then_render=True); return
-            short_graph = vertical.short_filtergraph(layout, self.video_size[0] / self.video_size[1])
+            shared = vertical.validate_layout(self.settings["short_layout"])
+            aspect = self.video_size[0] / self.video_size[1]
+            for row in selected_rows:
+                layout = vertical.validate_layout(row.clip.layout) or shared
+                if layout is None:   # first time: set the boxes, then carry on rendering
+                    self.open_short_editor(then_render=True); return
+                short_graphs[id(row.clip)] = vertical.short_filtergraph(layout, aspect)
         ext = os.path.splitext(self.video_path)[1] if mode == "copy" else ".mp4"
         try: os.makedirs(out_dir, exist_ok=True)
         except OSError as e: self._show_error(f"Couldn't create the export folder:\n{e}"); return
@@ -1347,7 +1340,7 @@ class HighlightScout:
             for i, (clip, out) in enumerate(jobs):
                 name = os.path.basename(out)
                 progress(i / len(jobs), f"RENDERING {i + 1}/{len(jobs)}: {name}")
-                error = run_export(build_export_cmd(src, clip, out, mode, short_graph), out, clip.end - clip.start,
+                error = run_export(build_export_cmd(src, clip, out, mode, short_graphs.get(id(clip))), out, clip.end - clip.start,
                                    lambda f: progress((i + f) / len(jobs)), self.cancel_event)
                 if error: failures.append(f"{name}:\n{error}")
                 else: exported.append(out)
@@ -1378,21 +1371,39 @@ class HighlightScout:
     def open_short_editor(self, then_render=False):
         if self.busy: return
         if not self.video_path: self._show_warning("Load a video first, so the layout can be set on a real frame."); return
+        self._stop_preview()    # the editor plays the clips itself
         aspect = self.video_size[0] / self.video_size[1]
-        layout = vertical.validate_layout(self.settings["short_layout"]) or vertical.default_layout(aspect)
-        row = self.current_row if self.current_row in self.rows else None
-        start = row.clip.peak if row else self.duration / 2
-        path = self.video_path
+        shared = vertical.validate_layout(self.settings["short_layout"])
+        start_from = shared or vertical.default_layout(aspect)
 
-        def saved(new_layout):
-            self.settings["short_layout"] = new_layout
+        rows = [r for r in self.rows if r.clip.selected] or self.rows    # the selected clips; all of them if none are
+        entries = []
+        for row in rows:
+            own = vertical.validate_layout(row.clip.layout)
+            entries.append({"clip": row.clip, "label": f"{row.num_label.cget('text')}  {fmt_time(row.clip.start)}  {row.clip.title or '(untitled)'}",
+                            "start": row.clip.start, "end": row.clip.end, "peak": row.clip.peak,
+                            "layout": vertical.copy_layout(own or start_from), "own": own is not None})
+        if not entries:   # no clips yet: set the layout on the video itself
+            entries.append({"clip": None, "label": "Whole video", "start": 0.0, "end": self.duration, "peak": self.duration / 2,
+                            "layout": vertical.copy_layout(start_from), "own": False})
+        first = rows.index(self.current_row) if self.current_row in rows else 0
+
+        def saved(results, new_shared):
+            for entry in results:
+                if entry["clip"] is not None: entry["clip"].layout = entry["layout"] if entry["own"] else None
+            self.settings["short_layout"] = new_shared
+            self._schedule_session_save()
             self._update_short_label()
             self.export_var.set(next(k for k, v in EXPORT_MODES.items() if v == "short"))
-            self.status_label.configure(text="VERTICAL LAYOUT SAVED")
+            self.status_label.configure(text="VERTICAL LAYOUTS SAVED")
             if then_render: self.render()
 
-        vertical.ShortLayoutEditor(self.root, layout, aspect, self.duration, start, lambda t: grab_frame(path, t),
-                                   self.ui_queue.put, self.palette, saved)
+        try:
+            vertical.ShortLayoutEditor(self.root, self.video_path, entries, shared, aspect, self.settings["preview_volume"], first,
+                                       self.palette, lambda v: self.settings.update(preview_volume=v), saved)
+        except Exception:
+            log_error(traceback.format_exc())
+            self._show_error(f"Couldn't open this video in the layout editor.\n\nDetails: {ERROR_LOG_PATH}")
 
     # --- BONES' CAPTION STUDIO ---
     def open_caption_studio(self, clip_path=None):

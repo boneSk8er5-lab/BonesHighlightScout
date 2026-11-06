@@ -3,19 +3,22 @@
 # ==============================================================================
 # Twitch-style portrait layout: one box over the webcam, one over the gameplay. The webcam is always
 # drawn on top. Boxes are stored as [x, y, w, h] fractions of the video frame, so a saved layout works
-# at any resolution with the same shape.
+# at any resolution with the same shape. Clips follow a shared layout unless they've been given their own.
 
-import threading
 import tkinter as tk
 
 import ttkbootstrap as tb
 from ttkbootstrap.constants import *
 from PIL import Image, ImageOps, ImageTk
 
+from player import Engine, PlaybackControls
+
 OUT_W, OUT_H = 1080, 1920
 CAM_MIN_H, CAM_MAX_H = 320, 1280     # webcam height in the short, so neither part gets squeezed out
 MIN_BOX = 0.04                       # smallest box, as a fraction of the frame
 HANDLE = 7                           # corner handle size on screen (half width)
+SOURCE_W, SOURCE_H = 720, 480        # the most room the video takes in the editor
+OWN_MARK = "  ●"                     # after a clip's name in the list: it has its own layout
 
 STYLES = {
     "Stacked (webcam above gameplay)": "stacked",
@@ -56,6 +59,10 @@ def default_layout(aspect):
     w = 0.25
     cam = [0.02, 0.02, w, w * aspect * 9 / 16]     # a 16:9 webcam in the top-left corner
     return {"style": "stacked", "cam": cam, "game": fit_game([0.0, 0.0, 1.0, 1.0], cam, "stacked", aspect)}
+
+
+def copy_layout(layout):
+    return {"style": layout["style"], "cam": list(layout["cam"]), "game": list(layout["game"])}
 
 
 def validate_layout(layout):
@@ -105,39 +112,45 @@ def compose_preview(frame, layout, width=270):
 
 
 # --- EDITOR WINDOW ---
-class ShortLayoutEditor(tb.Toplevel):
-    """Drag the boxes to move them, drag a corner to resize. The preview on the right shows the result."""
+class ShortLayoutEditor(PlaybackControls, tb.Toplevel):
+    """Pick a clip on the left, play it, and drag the boxes. The preview shows the short as it will come out.
 
-    def __init__(self, parent, layout, aspect, duration, start_time, grab_frame, post, palette, on_save):
+    entries: one dict per clip with label, start, end, peak, layout and own (True if the clip has its own layout).
+    shared: the layout clips follow unless they have their own, or None if none has been saved yet.
+    on_save(entries, shared) gets the results; nothing changes if the window is cancelled."""
+
+    def __init__(self, parent, path, entries, shared, aspect, volume, first, palette, on_volume, on_save):
+        engine = Engine(path, (1280, 720))   # raises if the video can't be opened, before any window appears
         super().__init__(parent)
         self.title("Vertical short layout")
         self.transient(parent)
-        self.aspect, self.duration = aspect, duration
-        self.grab_frame, self.post, self.on_save = grab_frame, post, on_save
+        self.engine = engine
+        self.first_volume = volume
+        self.engine.set_volume(volume)
+        self.engine.set_paused(True)
+        self.entries, self.aspect = entries, aspect
+        self.shared = copy_layout(shared) if shared else None
+        self.setting_shared = shared is None    # nothing saved yet: the first clip worked on sets the shared layout
+        self.on_volume, self.on_save = on_volume, on_save
         self.cam_color, self.game_color = palette["accent_hover"], palette["warn"]
-        self.layout = {"style": layout["style"], "cam": list(layout["cam"]), "game": list(layout["game"])}
+        self.index = None
+        self.layout = None
+        self.start = self.end = 0.0
         self.frame_image = None
-        self.frame_seq = 0
         self.drag = None
+        self.scrubbing = False
+        self.was_paused = True
+        self.ended = False
+        self._photo = self._preview_photo = None
         self._preview_job = None
 
-        self.cw = 880
+        self.cw = SOURCE_W
         self.ch = round(self.cw / aspect)
-        if self.ch > 560: self.ch = 560; self.cw = round(self.ch * aspect)
+        if self.ch > SOURCE_H: self.ch = SOURCE_H; self.cw = round(self.ch * aspect)
 
         body = tb.Frame(self, padding=12); body.pack(fill=BOTH, expand=YES)
-        left = tb.Frame(body); left.pack(side=LEFT, fill=BOTH, expand=YES)
-        tb.Label(left, text="Drag a box to move it, drag a corner to resize. The webcam always renders on top.", style="Muted.TLabel").pack(anchor="w", pady=(0, 6))
-        self.canvas = tk.Canvas(left, width=self.cw, height=self.ch, bg="#000000", highlightthickness=0)
-        self.canvas.pack()
-        self.image_item = self.canvas.create_image(0, 0, anchor="nw")
-
-        scrub = tb.Frame(left); scrub.pack(fill=X, pady=(10, 0))
-        tb.Label(scrub, text="FRAME").pack(side=LEFT, padx=(0, 8))
-        self.time_var = tk.DoubleVar(value=start_time)
-        scale = tb.Scale(scrub, from_=0, to=max(duration, 1), variable=self.time_var, bootstyle="primary")
-        scale.pack(side=LEFT, fill=X, expand=YES)
-        scale.bind("<ButtonRelease-1>", lambda e: self._load_frame())
+        self._build_clip_list(body)
+        self._build_source(body)
 
         right = tb.Frame(body); right.pack(side=LEFT, fill=Y, padx=(14, 0))
         tb.Label(right, text="PREVIEW (9:16)").pack(anchor="w", pady=(0, 6))
@@ -147,50 +160,157 @@ class ShortLayoutEditor(tb.Toplevel):
 
         bar = tb.Frame(self, padding=(12, 0, 12, 12)); bar.pack(fill=X)
         tb.Label(bar, text="LAYOUT").pack(side=LEFT, padx=(0, 6))
-        names = {v: k for k, v in STYLES.items()}
-        self.style_var = tk.StringVar(value=names[self.layout["style"]])
-        combo = tb.Combobox(bar, textvariable=self.style_var, values=list(STYLES), state="readonly", width=38, bootstyle="primary")
+        self.style_var = tk.StringVar()
+        combo = tb.Combobox(bar, textvariable=self.style_var, values=list(STYLES), state="readonly", width=38, bootstyle="primary", takefocus=False)
         combo.pack(side=LEFT)
         combo.bind("<<ComboboxSelected>>", lambda e: self._on_style())
-        tb.Button(bar, text="SAVE LAYOUT", style="BonesAccent.TButton", command=self._save).pack(side=RIGHT)
-        tb.Button(bar, text="CANCEL", style="BonesDanger.TButton", command=self.destroy).pack(side=RIGHT, padx=6)
-        tb.Button(bar, text="RESET", style="Bones.TButton", command=self._reset).pack(side=RIGHT)
+        self.all_btn = tb.Button(bar, text="USE ON ALL CLIPS", style="Bones.TButton", takefocus=False, command=self._use_on_all)
+        self.all_btn.pack(side=LEFT, padx=(10, 0))
+        tb.Button(bar, text="SAVE LAYOUTS", style="BonesAccent.TButton", takefocus=False, command=self._save).pack(side=RIGHT)
+        tb.Button(bar, text="CANCEL", style="BonesDanger.TButton", takefocus=False, command=self.close).pack(side=RIGHT, padx=6)
+        tb.Button(bar, text="RESET", style="Bones.TButton", takefocus=False, command=self._reset).pack(side=RIGHT)
+        if len(entries) < 2: self.all_btn.pack_forget()
 
         self.canvas.bind("<ButtonPress-1>", self._on_press)
         self.canvas.bind("<B1-Motion>", self._on_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_release)
         self.canvas.bind("<Motion>", self._on_hover)
-        self.bind("<Escape>", lambda e: self.destroy())
+        self.bind("<space>", lambda e: self.toggle())
+        self.bind("<Left>", lambda e: self._jump(-5))
+        self.bind("<Right>", lambda e: self._jump(5))
+        self.bind("<Escape>", lambda e: self.close())
+        self.protocol("WM_DELETE_WINDOW", self.close)
 
-        self._draw_boxes()
-        self._load_frame()
+        self._select(first)
+        self.clip_list.selection_set(first)
+
         # Open centred over the main window instead of wherever Windows puts it.
         self.update_idletasks()
         x = parent.winfo_rootx() + (parent.winfo_width() - self.winfo_reqwidth()) // 2
         y = parent.winfo_rooty() + max(0, (parent.winfo_height() - self.winfo_reqheight()) // 2)
         self.geometry(f"+{x}+{y}")
         self.grab_set()
+        self.focus_force()
+        self._poll()
 
-    # --- FRAME ---
-    def _load_frame(self):
-        self.frame_seq += 1
-        seq, t = self.frame_seq, float(self.time_var.get())
+    def _build_clip_list(self, body):
+        left = tb.Frame(body); left.pack(side=LEFT, fill=Y, padx=(0, 14))
+        tb.Label(left, text="SELECTED CLIPS").pack(anchor="w", pady=(0, 6))
+        holder = tb.Frame(left); holder.pack(fill=BOTH, expand=YES)
+        scroll = tb.Scrollbar(holder, orient=VERTICAL, bootstyle="round")
+        self.clip_list = tk.Listbox(holder, width=30, activestyle="none", exportselection=False, relief=FLAT, highlightthickness=0, takefocus=0,
+                                    bg="#151515", fg="#E0E0E0", selectbackground="#2D2D2D", selectforeground="#FFFFFF", font=("Segoe UI", 9),
+                                    yscrollcommand=scroll.set)
+        scroll.configure(command=self.clip_list.yview)
+        self.clip_list.pack(side=LEFT, fill=BOTH, expand=YES)
+        scroll.pack(side=LEFT, fill=Y)
+        for entry in self.entries: self.clip_list.insert(END, self._entry_text(entry))
+        self.clip_list.bind("<<ListboxSelect>>", self._on_list_select)
+        tb.Label(left, text=f"{OWN_MARK.strip()} = has its own layout", style="Muted.TLabel").pack(anchor="w", pady=(6, 0))
 
-        def work():
-            try: image = self.grab_frame(t)
-            except Exception: image = None
-            self.post(lambda: self._frame_ready(seq, image))
+    def _build_source(self, body):
+        left = tb.Frame(body); left.pack(side=LEFT, fill=BOTH, expand=YES)
+        self.hint = tb.Label(left, text="", style="Muted.TLabel"); self.hint.pack(anchor="w", pady=(0, 6))
+        self.canvas = tk.Canvas(left, width=self.cw, height=self.ch, bg="#000000", highlightthickness=0)
+        self.canvas.pack()
+        self.image_item = self.canvas.create_image(0, 0, anchor="nw")
 
-        threading.Thread(target=work, daemon=True).start()
+        scrub = tb.Frame(left); scrub.pack(fill=X, pady=(10, 0))
+        self.play_btn = tb.Button(scrub, text="PLAY", style="BonesAccent.TButton", width=8, takefocus=False, command=self.toggle)
+        self.play_btn.pack(side=LEFT, padx=(0, 10))
+        self.time_label = tb.Label(scrub, text="00:00 / 00:00", width=14); self.time_label.pack(side=RIGHT, padx=(10, 0))
+        self.pos_var = tk.DoubleVar(value=0)
+        self.scrubber = tb.Scale(scrub, from_=0, to=1, variable=self.pos_var, bootstyle="primary", takefocus=False)
+        self.scrubber.pack(side=LEFT, fill=X, expand=YES)
+        self._bind_scrubber()
 
-    def _frame_ready(self, seq, image):
-        if seq != self.frame_seq or image is None or not self.winfo_exists(): return
-        self.frame_image = image.convert("RGB")
-        self._shown = ImageTk.PhotoImage(self.frame_image.resize((self.cw, self.ch), Image.BILINEAR), master=self)
-        self.canvas.itemconfigure(self.image_item, image=self._shown)
+        sound = tb.Frame(left); sound.pack(fill=X, pady=(8, 0))
+        tb.Label(sound, text="VOLUME").pack(side=LEFT)
+        self.volume_var = tk.DoubleVar(value=self.first_volume)
+        tb.Scale(sound, from_=0, to=1, length=150, variable=self.volume_var, bootstyle="primary", takefocus=False,
+                 command=lambda v: self._set_volume(float(v))).pack(side=LEFT, padx=8)
+
+    # --- CLIPS ---
+    def _entry_text(self, entry):
+        return entry["label"] + (OWN_MARK if entry["own"] else "")
+
+    def _refresh_entry(self, index):
+        selected = index == self.index
+        self.clip_list.delete(index)
+        self.clip_list.insert(index, self._entry_text(self.entries[index]))
+        if selected: self.clip_list.selection_set(index)
+
+    def _on_list_select(self, event):
+        chosen = self.clip_list.curselection()
+        if chosen and chosen[0] != self.index: self._select(chosen[0])
+
+    def _select(self, index):
+        if self.index is not None: self.setting_shared = self.setting_shared and self.shared is None
+        self.index = index
+        entry = self.entries[index]
+        if not entry["own"] and self.shared: entry["layout"] = copy_layout(self.shared)   # follows the shared layout
+        self.layout = entry["layout"]
+        self.start, self.end = entry["start"], entry["end"]
+        self.ended = False
+        self.scrubber.configure(from_=0, to=max(self.end - self.start, 0.1))
+        self.engine.set_paused(True)
+        self.play_btn.configure(text="PLAY")
+        self.engine.play_range(self.start, self.end)
+        self.engine.seek(entry["peak"])            # open on the moment the clip was picked for
+        self.style_var.set(next(k for k, v in STYLES.items() if v == self.layout["style"]))
+        self._update_hint()
+        self._draw_boxes()
         self._queue_preview()
 
-    # --- DRAWING ---
+    def _update_hint(self):
+        if len(self.entries) < 2 and self.entries[0]["clip"] is None:
+            text = "No clips selected, so this sets the layout every clip starts with. Drag a box to move it, drag a corner to resize."
+        elif self.setting_shared:
+            text = "First layout: all clips start from this one. Drag a box to move it, drag a corner to resize."
+        elif self.entries[self.index]["own"]:
+            text = "This clip has its own layout. Drag a box to move it, drag a corner to resize."
+        else:
+            text = "Drag a box to move it, drag a corner to resize. Changes apply to this clip only. The webcam always renders on top."
+        self.hint.configure(text=text)
+
+    def _edited(self):
+        """A box or the layout type changed on the current clip."""
+        entry = self.entries[self.index]
+        if self.setting_shared:
+            self.shared = copy_layout(self.layout)   # the first clip worked on sets what the others start from
+        else:
+            if not entry["own"]:
+                entry["own"] = True
+                self._refresh_entry(self.index)
+                self._update_hint()
+        self._draw_boxes()
+        self._queue_preview()
+
+    def _use_on_all(self):
+        self.shared = copy_layout(self.layout)
+        self.setting_shared = False
+        for i, entry in enumerate(self.entries):
+            entry["own"] = False
+            if i != self.index: entry["layout"] = copy_layout(self.layout)
+            self._refresh_entry(i)
+        self._update_hint()
+
+    # --- PICTURE ---
+    def _poll(self):
+        if not self.winfo_exists(): return
+        self._tick()
+        self.after(15, self._poll)
+
+    def _show(self, pixels):
+        self.frame_image = Image.frombuffer("RGB", self.engine.size, pixels, "raw", "RGB", 0, 1)
+        source = self.frame_image.resize((self.cw, self.ch), Image.BILINEAR)
+        if self._photo is None:
+            self._photo = ImageTk.PhotoImage(source, master=self)
+            self.canvas.itemconfigure(self.image_item, image=self._photo)
+        else:
+            self._photo.paste(source)
+        self._draw_preview()
+
     def _rect(self, box):
         x, y, w, h = box
         return x * self.cw, y * self.ch, (x + w) * self.cw, (y + h) * self.ch
@@ -210,14 +330,15 @@ class ShortLayoutEditor(tb.Toplevel):
         if self._preview_job is None: self._preview_job = self.after(30, self._draw_preview)
 
     def _draw_preview(self):
-        self._preview_job = None
+        if self._preview_job is not None:
+            self.after_cancel(self._preview_job); self._preview_job = None
         if self.frame_image is None: return
-        self._preview_photo = ImageTk.PhotoImage(compose_preview(self.frame_image, self.layout), master=self)
-        self.preview.itemconfigure(self.preview_item, image=self._preview_photo)
-
-    def _changed(self):
-        self._draw_boxes()
-        self._queue_preview()
+        image = compose_preview(self.frame_image, self.layout)
+        if self._preview_photo is None:
+            self._preview_photo = ImageTk.PhotoImage(image, master=self)
+            self.preview.itemconfigure(self.preview_item, image=self._preview_photo)
+        else:
+            self._preview_photo.paste(image)
 
     # --- MOUSE ---
     def _hit(self, ex, ey):
@@ -254,7 +375,7 @@ class ShortLayoutEditor(tb.Toplevel):
             self.layout["game"] = fit_game(self.layout["game"], self.layout["cam"], self.layout["style"], self.aspect)
         else:
             self.layout["game"] = self._resize_game(box, mode, mx, my)
-        self._changed()
+        self._edited()
 
     def _resize_cam(self, box, mode, mx, my):
         x0, y0, x1, y1 = box[0], box[1], box[0] + box[2], box[1] + box[3]
@@ -281,19 +402,27 @@ class ShortLayoutEditor(tb.Toplevel):
         return _clamp_box([ax - w if "l" in mode else ax, ay - h if "t" in mode else ay, w, h])
 
     # --- BUTTONS ---
+    def _set_volume(self, volume):
+        self.engine.set_volume(volume)
+        self.on_volume(volume)
+
     def _on_style(self):
         self.layout["style"] = STYLES[self.style_var.get()]
         self.layout["game"] = fit_game(self.layout["game"], self.layout["cam"], self.layout["style"], self.aspect)
-        self._changed()
+        self._edited()
 
     def _reset(self):
-        style = self.layout["style"]
-        self.layout = default_layout(self.aspect)
-        self.layout["style"] = style
-        self.layout["game"] = fit_game([0.0, 0.0, 1.0, 1.0], self.layout["cam"], style, self.aspect)
-        self._changed()
+        fresh = default_layout(self.aspect)
+        self.layout["cam"] = fresh["cam"]
+        self.layout["game"] = fit_game([0.0, 0.0, 1.0, 1.0], fresh["cam"], self.layout["style"], self.aspect)
+        self._edited()
 
     def _save(self):
-        layout = self.layout
+        entries, shared = self.entries, self.shared or copy_layout(self.layout)
+        self.close()
+        self.on_save(entries, shared)
+
+    def close(self):
+        engine, self.engine = self.engine, None
+        if engine: engine.close()
         self.destroy()
-        self.on_save(layout)

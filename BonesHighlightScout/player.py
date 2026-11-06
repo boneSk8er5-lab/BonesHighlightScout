@@ -164,7 +164,7 @@ class WaveOut:
 class Engine:
     """Plays one video file; clips are just ranges of it. All public methods are for the UI thread."""
 
-    def __init__(self, path):
+    def __init__(self, path, max_size=(MAX_W, MAX_H)):
         import av
         self.av = av
         self.path = path
@@ -173,7 +173,7 @@ class Engine:
         self.vs.thread_type = "AUTO"
         self.astream = self.container.streams.audio[0] if self.container.streams.audio else None
         self.offset = (self.container.start_time or 0) / av.time_base   # file timestamps may not start at 0
-        k = min(MAX_W / self.vs.width, MAX_H / self.vs.height)
+        k = min(max_size[0] / self.vs.width, max_size[1] / self.vs.height)
         self.size = (max(2, int(self.vs.width * k) // 2 * 2), max(2, int(self.vs.height * k) // 2 * 2))
         try: self.wave = WaveOut() if self.astream is not None else None
         except (OSError, AttributeError): self.wave = None
@@ -323,7 +323,92 @@ def _fmt(seconds):
     return f"{seconds // 60:02d}:{seconds % 60:02d}"
 
 
-class ClipPreview(tb.Toplevel):
+class PlaybackControls:
+    """Play / pause and the scrubber, shared by the preview window and the vertical layout editor.
+    The window provides engine, start, end, scrubbing, was_paused, ended, scrubber, pos_var, play_btn, time_label and _show()."""
+
+    def toggle(self):
+        if not self.engine: return
+        if self.ended:   # at the end: play again from the top
+            self.ended = False
+            self.engine.seek(self.start)
+            self.engine.set_paused(False)
+            self.play_btn.configure(text="PAUSE")
+            return
+        paused = not self.engine.paused
+        self.engine.set_paused(paused)
+        self.play_btn.configure(text="PLAY" if paused else "PAUSE")
+
+    def _jump(self, seconds):
+        if not self.engine: return
+        target = min(max(self.engine.clock() + seconds, self.start), self.end - 0.1)
+        self.ended = False
+        self.play_btn.configure(text="PLAY" if self.engine.paused else "PAUSE")
+        self.engine.seek(target)
+
+    def _tick(self):
+        """Shows the frame that's due and keeps the scrubber, the time and the end of the clip up to date."""
+        if not self.engine: return
+        frame = self.engine.next_frame()
+        if frame: self._show(frame[1])
+        if not self.scrubbing:
+            now = self.engine.clock()
+            self.pos_var.set(min(max(now - self.start, 0), self.end - self.start))
+            self._update_time(now - self.start)
+            if not self.ended and not self.engine.paused and self.engine.finished():
+                self.ended = True
+                self.engine.set_paused(True)
+                self.play_btn.configure(text="REPLAY")
+
+    def _update_time(self, position):
+        self.time_label.configure(text=f"{_fmt(position)} / {_fmt(self.end - self.start)}")
+
+    def _bind_scrubber(self):
+        self._seek_job = None
+        self.scrubber.bind("<ButtonPress-1>", self._scrub_press)
+        self.scrubber.bind("<B1-Motion>", self._scrub_move)
+        self.scrubber.bind("<ButtonRelease-1>", self._scrub_release)
+
+    def _scrub_position(self, event):
+        width = max(self.scrubber.winfo_width() - 16, 1)    # the handle's half width on each side
+        return min(max((event.x - 8) / width, 0.0), 1.0) * (self.end - self.start)
+
+    def _scrub_press(self, event):
+        if not self.engine: return "break"
+        self.scrubbing = True
+        self.was_paused = self.engine.paused
+        self.engine.set_paused(True)
+        self._scrub_move(event)
+        return "break"
+
+    def _scrub_move(self, event):
+        if not self.scrubbing: return "break"
+        position = self._scrub_position(event)
+        self.pos_var.set(position)
+        self._update_time(position)
+        if self._seek_job is None:   # seek at most ~12 times a second while dragging
+            self._seek_job = self.after(80, self._scrub_seek)
+        return "break"
+
+    def _scrub_seek(self):
+        self._seek_job = None
+        if self.engine: self.engine.seek(self.start + self.pos_var.get())
+
+    def _scrub_release(self, event):
+        if not self.scrubbing: return "break"
+        self.scrubbing = False
+        if self._seek_job is not None:
+            self.after_cancel(self._seek_job); self._seek_job = None
+        position = self._scrub_position(event)
+        self.pos_var.set(position)
+        self.engine.seek(self.start + position)
+        self.ended = False
+        self.engine.set_paused(self.was_paused)
+        self.play_btn.configure(text="PLAY" if self.was_paused else "PAUSE")
+        return "break"
+
+
+class ClipPreview(PlaybackControls, tb.Toplevel):
     """on_step(-1 or +1) asks the app for the previous / next clip; on_volume(v) lets it remember the volume."""
 
     def __init__(self, parent, volume, on_step, on_volume, on_close):
@@ -336,7 +421,6 @@ class ClipPreview(tb.Toplevel):
         self.was_paused = False
         self.ended = False
         self.photo = None
-        self._seek_job = None
 
         self.heading = tb.Label(self, text="", font=("Segoe UI", 10, "bold"), padding=(12, 10, 12, 6))
         self.heading.pack(fill=X)
@@ -349,9 +433,7 @@ class ClipPreview(tb.Toplevel):
         self.pos_var = tk.DoubleVar(value=0)
         self.scrubber = tb.Scale(scrub, from_=0, to=1, variable=self.pos_var, bootstyle="primary", takefocus=False)
         self.scrubber.pack(side=LEFT, fill=X, expand=YES)
-        self.scrubber.bind("<ButtonPress-1>", self._scrub_press)
-        self.scrubber.bind("<B1-Motion>", self._scrub_move)
-        self.scrubber.bind("<ButtonRelease-1>", self._scrub_release)
+        self._bind_scrubber()
 
         bar = tb.Frame(self, padding=12); bar.pack(fill=X)
         self.prev_btn = tb.Button(bar, text="PREVIOUS", style="Bones.TButton", takefocus=False, command=lambda: self.on_step(-1))
@@ -405,25 +487,6 @@ class ClipPreview(tb.Toplevel):
         self.next_btn.configure(state=NORMAL if has_next else DISABLED)
 
     # --- playback ---
-    def toggle(self):
-        if not self.engine: return
-        if self.ended:   # at the end: play again from the top
-            self.ended = False
-            self.engine.seek(self.start)
-            self.engine.set_paused(False)
-            self.play_btn.configure(text="PAUSE")
-            return
-        paused = not self.engine.paused
-        self.engine.set_paused(paused)
-        self.play_btn.configure(text="PLAY" if paused else "PAUSE")
-
-    def _jump(self, seconds):
-        if not self.engine: return
-        target = min(max(self.engine.clock() + seconds, self.start), self.end - 0.1)
-        self.ended = False
-        self.play_btn.configure(text="PLAY" if self.engine.paused else "PAUSE")
-        self.engine.seek(target)
-
     def _set_volume(self, volume):
         self.volume_label.configure(text=f"{int(volume * 100)}%")
         if self.engine: self.engine.set_volume(volume)
@@ -431,17 +494,7 @@ class ClipPreview(tb.Toplevel):
 
     def _poll(self):
         if not self.winfo_exists(): return
-        if self.engine:
-            frame = self.engine.next_frame()
-            if frame: self._show(frame[1])
-            if not self.scrubbing:
-                now = self.engine.clock()
-                self.pos_var.set(min(max(now - self.start, 0), self.end - self.start))
-                self._update_time(now - self.start)
-                if not self.ended and not self.engine.paused and self.engine.finished():
-                    self.ended = True
-                    self.engine.set_paused(True)
-                    self.play_btn.configure(text="REPLAY")
+        self._tick()
         self.after(15, self._poll)
 
     def _show(self, pixels):
@@ -451,48 +504,6 @@ class ClipPreview(tb.Toplevel):
             self.canvas.itemconfigure(self.image_item, image=self.photo)
         else:
             self.photo.paste(image)
-
-    def _update_time(self, position):
-        self.time_label.configure(text=f"{_fmt(position)} / {_fmt(self.end - self.start)}")
-
-    # --- scrubber ---
-    def _scrub_position(self, event):
-        width = max(self.scrubber.winfo_width() - 16, 1)    # the handle's half width on each side
-        return min(max((event.x - 8) / width, 0.0), 1.0) * (self.end - self.start)
-
-    def _scrub_press(self, event):
-        if not self.engine: return "break"
-        self.scrubbing = True
-        self.was_paused = self.engine.paused
-        self.engine.set_paused(True)
-        self._scrub_move(event)
-        return "break"
-
-    def _scrub_move(self, event):
-        if not self.scrubbing: return "break"
-        position = self._scrub_position(event)
-        self.pos_var.set(position)
-        self._update_time(position)
-        if self._seek_job is None:   # seek at most ~12 times a second while dragging
-            self._seek_job = self.after(80, self._scrub_seek)
-        return "break"
-
-    def _scrub_seek(self):
-        self._seek_job = None
-        if self.engine: self.engine.seek(self.start + self.pos_var.get())
-
-    def _scrub_release(self, event):
-        if not self.scrubbing: return "break"
-        self.scrubbing = False
-        if self._seek_job is not None:
-            self.after_cancel(self._seek_job); self._seek_job = None
-        position = self._scrub_position(event)
-        self.pos_var.set(position)
-        self.engine.seek(self.start + position)
-        self.ended = False
-        self.engine.set_paused(self.was_paused)
-        self.play_btn.configure(text="PLAY" if self.was_paused else "PAUSE")
-        return "break"
 
     # --- closing ---
     def close(self):
