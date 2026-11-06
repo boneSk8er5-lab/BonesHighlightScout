@@ -22,6 +22,7 @@ MIN_OUT = 0.1                        # narrowest box in the short
 MAX_CAM_H = 0.6                      # the position buttons won't let the webcam take more of the short than this
 HANDLE = 7                           # corner handle size on the source view (half width)
 OUT_HANDLE = 6                       # the same on the preview
+EDGE_GRAB = 5                        # how close to a side of a source box counts as grabbing that side (pixels)
 SOURCE_W, SOURCE_H = 640, 480        # the most room the video takes in the editor
 PREVIEW_W, PREVIEW_H = 270, 480
 OWN_MARK = "  ●"                     # after a clip's name in the list: it has its own layout
@@ -435,11 +436,11 @@ class ShortLayoutEditor(PlaybackControls, tb.Toplevel):
         if len(self.entries) < 2 and self.entries[0]["clip"] is None:
             text = "No clips selected, so this sets the layout every clip starts with."
         elif self.setting_shared:
-            text = "First layout: all clips start from this one. Drag a box to move it, drag a corner to resize."
+            text = "First layout: all clips start from this one. Drag a box to move it, a corner to resize, a side to crop just that side."
         elif self.entries[self.index]["own"]:
-            text = "This clip has its own layout. Drag a box to move it, drag a corner to resize."
+            text = "This clip has its own layout. Drag a box to move it, a corner to resize, a side to crop just that side."
         else:
-            text = "Drag a box to move it, drag a corner to resize. Changes apply to this clip only."
+            text = "Drag a box to move it, a corner to resize, a side to crop just that side. Changes apply to this clip only."
         self.hint.configure(text=text)
 
     def _edited(self):
@@ -487,19 +488,23 @@ class ShortLayoutEditor(PlaybackControls, tb.Toplevel):
         x, y, w, h = box
         return x * PREVIEW_W, y * PREVIEW_H, (x + w) * PREVIEW_W, (y + h) * PREVIEW_H
 
-    def _draw_box(self, canvas, rect, color, name, handle, width):
+    def _draw_box(self, canvas, rect, color, name, handle, width, edges=False):
         x0, y0, x1, y1 = rect
         canvas.create_rectangle(x0, y0, x1, y1, outline=color, width=width, tags="box")   # outline only: you need to see what's under it
         canvas.create_rectangle(x0 + 3, y0 + 3, x0 + 12 + 7 * len(name), y0 + 22, fill="#000000", outline="", tags="box")
         canvas.create_text(x0 + 8, y0 + 5, text=name, anchor="nw", fill=color, font=("Segoe UI", 9, "bold"), tags="box")
-        for hx, hy in ((x0, y0), (x1, y0), (x0, y1), (x1, y1)):
+        spots = [(x0, y0), (x1, y0), (x0, y1), (x1, y1)]
+        if edges:
+            mx, my = (x0 + x1) / 2, (y0 + y1) / 2
+            spots += [(mx, y0), (mx, y1), (x0, my), (x1, my)]
+        for hx, hy in spots:
             canvas.create_rectangle(hx - handle, hy - handle, hx + handle, hy + handle, fill=color, outline="#000000", tags="box")
 
     def _draw_boxes(self):
         # Gameplay first, webcam second, so the webcam is on top here as well as in the short.
         self.canvas.delete("box")
-        self._draw_box(self.canvas, self._rect(self.layout["game"]), self.game_color, "GAMEPLAY", HANDLE, 3)
-        self._draw_box(self.canvas, self._rect(self.layout["cam"]), self.cam_color, "WEBCAM", HANDLE, 3)
+        self._draw_box(self.canvas, self._rect(self.layout["game"]), self.game_color, "GAMEPLAY", HANDLE, 3, edges=True)
+        self._draw_box(self.canvas, self._rect(self.layout["cam"]), self.cam_color, "WEBCAM", HANDLE, 3, edges=True)
         # On the preview the boxes only show while the mouse is over it, so it can be watched clean.
         self.preview.delete("box")
         if self.over_preview or self.out_drag:
@@ -525,24 +530,33 @@ class ShortLayoutEditor(PlaybackControls, tb.Toplevel):
             self._preview_photo.paste(image)
 
     # --- MOUSE ON THE VIDEO: what to show ---
-    def _hit(self, ex, ey, keys, rect, handle):
+    def _hit(self, ex, ey, keys, rect, handle, edges=False):
         """(box name, what to do). The webcam is checked first because it's on top."""
         for name in keys:
             x0, y0, x1, y1 = rect(self.layout[name])
             for corner, hx, hy in (("tl", x0, y0), ("tr", x1, y0), ("bl", x0, y1), ("br", x1, y1)):
                 if abs(ex - hx) <= handle + 2 and abs(ey - hy) <= handle + 2: return name, corner
+            if edges:   # anywhere along a side, for cropping just that side
+                near = EDGE_GRAB
+                if x0 <= ex <= x1:
+                    if abs(ey - y0) <= near: return name, "t"
+                    if abs(ey - y1) <= near: return name, "b"
+                if y0 <= ey <= y1:
+                    if abs(ex - x0) <= near: return name, "l"
+                    if abs(ex - x1) <= near: return name, "r"
             if x0 <= ex <= x1 and y0 <= ey <= y1: return name, "move"
         return None
 
     def _cursor(self, hit):
-        cursors = {"move": "fleur", "tl": "size_nw_se", "br": "size_nw_se", "tr": "size_ne_sw", "bl": "size_ne_sw"}
+        cursors = {"move": "fleur", "tl": "size_nw_se", "br": "size_nw_se", "tr": "size_ne_sw", "bl": "size_ne_sw",
+                   "t": "size_ns", "b": "size_ns", "l": "size_we", "r": "size_we"}
         return cursors[hit[1]] if hit else ""
 
     def _on_hover(self, event):
-        self.canvas.configure(cursor=self._cursor(self._hit(event.x, event.y, ("cam", "game"), self._rect, HANDLE)))
+        self.canvas.configure(cursor=self._cursor(self._hit(event.x, event.y, ("cam", "game"), self._rect, HANDLE, edges=True)))
 
     def _on_press(self, event):
-        hit = self._hit(event.x, event.y, ("cam", "game"), self._rect, HANDLE)
+        hit = self._hit(event.x, event.y, ("cam", "game"), self._rect, HANDLE, edges=True)
         if not hit: self.drag = None; return
         self.drag = {"name": hit[0], "mode": hit[1], "start": (event.x, event.y), "box": list(self.layout[hit[0]])}
 
@@ -564,10 +578,11 @@ class ShortLayoutEditor(PlaybackControls, tb.Toplevel):
 
     def _resize_source(self, box, mode, mx, my):
         x0, y0, x1, y1 = box[0], box[1], box[0] + box[2], box[1] + box[3]
+        # mode names the sides being dragged: one side ("t") or a corner's two ("tl").
         if "l" in mode: x0 = min(mx, x1 - MIN_BOX)
-        else: x1 = max(mx, x0 + MIN_BOX)
+        if "r" in mode: x1 = max(mx, x0 + MIN_BOX)
         if "t" in mode: y0 = min(my, y1 - MIN_BOX)
-        else: y1 = max(my, y0 + MIN_BOX)
+        if "b" in mode: y1 = max(my, y0 + MIN_BOX)
         return _clamp_box([x0, y0, x1 - x0, y1 - y0])
 
     # --- MOUSE ON THE PREVIEW: where it goes ---
