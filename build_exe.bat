@@ -6,6 +6,14 @@ rem   build_exe.bat --with-ffmpeg   also copies ffmpeg, ffprobe and ffplay into 
 rem                                 on PCs without ffmpeg (adds about 650 MB with a "full" ffmpeg build)
 cd /d "%~dp0"
 
+rem Windows won't let a running program be replaced.
+tasklist /FI "IMAGENAME eq BonesHighlightScout.exe" | find /I "BonesHighlightScout.exe" >nul
+if not errorlevel 1 (
+    echo Bones Highlight Scout is still open. Close it, then run this again.
+    pause
+    exit /b 1
+)
+
 echo Installing build tools...
 python -m pip install -q -r BonesHighlightScout\requirements.txt pyinstaller
 if errorlevel 1 goto :fail
