@@ -53,6 +53,7 @@ def main():
     with open(os.path.join(stage, "portable.txt"), "w") as f:
         f.write("This file tells Bones Highlight Scout to keep its settings in the data folder here.\n")
     shutil.copy2(os.path.join(ROOT, "release_files", "README.txt"), stage)
+    shutil.copy2(os.path.join(ROOT, "LICENSE"), os.path.join(stage, "LICENSE.txt"))
     with open(os.path.join(ROOT, "release_files", "THIRD-PARTY-NOTICES.txt"), encoding="utf-8") as f: notices = f.read()
     version_line = version_output.splitlines()[0]
     commit = re.search(r"git-([0-9a-f]+)", version_line)

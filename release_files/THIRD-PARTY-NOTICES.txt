@@ -1,6 +1,10 @@
 THIRD-PARTY SOFTWARE IN BONES HIGHLIGHT SCOUT
 =============================================
-This app includes the open-source software below. Each stays under its own license.
+Bones Highlight Scout's own code is under the MIT License (see LICENSE.txt):
+https://github.com/boneSk8er5-lab/BonesHighlightScout
+
+It also includes the open-source software below. Each stays under its own license,
+which the MIT License doesn't change.
 
 
 FFmpeg (ffmpeg\ffmpeg.exe)

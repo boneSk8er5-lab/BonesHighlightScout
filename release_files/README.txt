@@ -47,13 +47,17 @@ Please try it on your own recordings, especially:
 
 REPORTING A PROBLEM
 -------------------
-Tell us what you did, what you expected and what happened. A screenshot helps.
+Report problems and ideas here (a free GitHub account is needed):
+
+    https://github.com/boneSk8er5-lab/BonesHighlightScout/issues
+
+Say what you did, what you expected and what happened. A screenshot helps.
 If something went wrong, please attach this file if it exists:
 
     data\error.log   (in this folder)
 
 It holds technical error details only, and may include file names and folder paths
-from your PC. Have a look first if that matters to you.
+from your PC. Issues are public, so have a look first and remove anything private.
 
 
 KNOWN LIMITS
