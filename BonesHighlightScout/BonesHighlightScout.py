@@ -3,7 +3,7 @@
 # ==============================================================================
 # Finds the loud / hype moments in a video from its audio, lets you review and
 # trim them, then exports the keepers with ffmpeg.
-# Needs ffmpeg, ffprobe and ffplay on PATH. Python packages: requirements.txt
+# Needs ffmpeg and ffprobe on PATH. Python packages: requirements.txt
 
 import ctypes
 import hashlib
@@ -42,6 +42,7 @@ except ImportError:
 
 import hype
 import vertical
+import player
 
 # --- DPI FIX / TASKBAR ICON ---
 if platform.system() == "Windows":
@@ -146,6 +147,7 @@ DEFAULT_SETTINGS = {
     "colorblind": False,
     "caption_studio_path": "",
     "short_layout": {},
+    "preview_volume": 0.8,
 }
 
 
@@ -227,7 +229,7 @@ def tool(name):
     return find_tool(name) or name
 
 def missing_tools():
-    return [t for t in ("ffmpeg", "ffprobe", "ffplay") if find_tool(t) is None]
+    return [t for t in ("ffmpeg", "ffprobe") if find_tool(t) is None]   # ffplay is only a fallback for the built-in player
 
 # --- CLIP MEMORY ---
 # Clips are saved per video (keyed by path, size and modified time) so reopening a video brings them back.
@@ -620,6 +622,8 @@ class HighlightScout:
         self.cancel_event = threading.Event()
         self.busy = False
         self.preview_proc = None
+        self.preview_window = None           # the clip player, while it's open
+        self.preview_row = None              # the clip it's showing (None for a spot clicked on the waveform)
 
         self.video_path = ""
         self.duration = 0.0
@@ -1048,6 +1052,7 @@ class HighlightScout:
         self._set_current_row(self.rows[0] if self.rows else None)
         self.list_frame.yview_moveto(0)
         self._refresh_counts(); self._draw_clip_spans()
+        self._refresh_preview_buttons()
 
     def _make_row(self, number, clip):
         frame = tb.Frame(self.list_frame); frame.pack(fill=X, pady=2, padx=(0, 14))
@@ -1136,11 +1141,15 @@ class HighlightScout:
         if not self.clips: self.empty_label.pack(pady=40)
         self._refresh_counts(); self._draw_clip_spans()
         self._schedule_session_save()
+        self._refresh_preview_buttons()
 
     def _preview_row(self, row):
         self._set_current_row(row)
         if not row.valid: self._show_warning("Fix the start/end time first (it's shown in red)."); return
-        self.preview(row.clip.start, row.clip.end)
+        index = self.rows.index(row)
+        heading = f"Clip {row.num_label.cget('text')}  ·  {row.clip.title or '(untitled)'}"
+        self.preview_row = row
+        self._open_player(row.clip.start, row.clip.end, heading, index > 0, index < len(self.rows) - 1)
 
     # --- CLIP MEMORY ---
     def _schedule_session_save(self):
@@ -1261,15 +1270,45 @@ class HighlightScout:
 
     # --- PREVIEW ---
     def preview(self, start, end):
+        """A spot clicked on the waveform, not one of the clips: no previous / next."""
         if not self.video_path: return
-        self._stop_preview()
+        self.preview_row = None
+        self._open_player(start, end, f"Preview  ·  {fmt_time(start)} - {fmt_time(end)}", False, False)
+
+    def _open_player(self, start, end, heading, has_prev, has_next):
+        if self.preview_window is None:
+            self.preview_window = player.ClipPreview(self.root, self.settings["preview_volume"], self._step_preview,
+                                                     lambda v: self.settings.update(preview_volume=v), self._on_player_closed)
+        try:
+            self.preview_window.load(self.video_path, start, end, heading, has_prev, has_next)
+        except Exception:   # a file the player can't open or a missing library: ffplay can still show it
+            log_error(traceback.format_exc())
+            self.preview_window.close()
+            self._preview_with_ffplay(start, end)
+
+    def _preview_with_ffplay(self, start, end):
         cmd = [tool("ffplay"), "-hide_banner", "-loglevel", "error", "-autoexit", "-x", "960", "-y", "540",
                "-window_title", f"Preview {fmt_time(start)} - {fmt_time(end)}",
                "-ss", f"{start:.2f}", "-t", f"{end - start:.2f}", self.video_path]
         try: self.preview_proc = start_process(cmd, low_priority=False)
         except ScoutError as e: self._show_error(str(e))
 
+    def _step_preview(self, step):
+        if self.preview_row not in self.rows: return
+        index = self.rows.index(self.preview_row) + step
+        if 0 <= index < len(self.rows): self._preview_row(self.rows[index])
+
+    def _refresh_preview_buttons(self):
+        """The clip list changed: Previous / Next may have nowhere to go now."""
+        if self.preview_window is None: return
+        index = self.rows.index(self.preview_row) if self.preview_row in self.rows else None
+        self.preview_window.set_neighbours(index is not None and index > 0, index is not None and index < len(self.rows) - 1)
+
+    def _on_player_closed(self):
+        self.preview_window, self.preview_row = None, None
+
     def _stop_preview(self):
+        if self.preview_window is not None: self.preview_window.close()
         if self.preview_proc is not None:
             if self.preview_proc.poll() is None: self.preview_proc.kill()
             untrack_process(self.preview_proc); self.preview_proc = None

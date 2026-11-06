@@ -24,6 +24,7 @@
     <Compile Include="BonesHighlightScout.py" />
     <Compile Include="hype.py" />
     <Compile Include="vertical.py" />
+    <Compile Include="player.py" />
   </ItemGroup>
   <ItemGroup>
     <Content Include="requirements.txt" />
