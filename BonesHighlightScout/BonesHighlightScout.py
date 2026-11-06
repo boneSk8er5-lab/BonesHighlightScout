@@ -352,6 +352,18 @@ def start_process(cmd, low_priority=True, **kwargs):
     with _procs_lock: _active_procs.add(proc)
     return proc
 
+def dark_title_bar(window):
+    """Windows' own dark title bar, in the app's background color. Windows 10 ignores the color and just goes dark."""
+    if platform.system() != "Windows": return
+    def colorref(color):   # Windows wants 0x00BBGGRR
+        return int(color[5:7] + color[3:5] + color[1:3], 16)
+    try:
+        hwnd = ctypes.windll.user32.GetParent(window.winfo_id()) or window.winfo_id()
+        for attribute, value in ((20, 1), (35, colorref(WINDOW_BG)), (36, colorref(TEXT))):   # dark mode, bar color, title color
+            value = ctypes.c_int(value)
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(ctypes.c_void_p(hwnd), attribute, ctypes.byref(value), ctypes.sizeof(value))
+    except Exception: pass
+
 def set_own_priority(low):
     """The AI models run inside this process, so it drops to low priority while a job is running."""
     if platform.system() != "Windows": return
@@ -598,6 +610,9 @@ class HighlightScout:
         self.root.title(f"Bones Highlight Scout v{APP_VERSION}")
         self.root.geometry("1280x780"); self.root.minsize(1000, 640)
         self.root.report_callback_exception = self._on_tk_error
+        # Every window as it appears: the main one ("Tk") and pop-ups like the layout editor and messages ("Toplevel").
+        for window_class in ("Tk", "Toplevel"):
+            self.root.bind_class(window_class, "<Map>", lambda e: dark_title_bar(e.widget), add="+")
         try: self.root.iconbitmap(default=resource_path(ICON_FILE))   # default= also covers dialogs
         except tk.TclError: pass
 
